@@ -4,15 +4,6 @@ import pandas as pd
 import time
 import os
 
-# ==========================================
-# 1. CONFIGURACIÓN DEL CUARTEL GENERAL
-# ==========================================
-TELEGRAM_TOKEN = "Pega_Aqui_Tu_Token"
-TELEGRAM_CHAT_ID = "Pega_Aqui_Tu_Chat_ID"
-
-API_KEY_BINANCE = "Pega_Aqui_Tu_API_Key"
-API_SECRET_BINANCE = "Pega_Aqui_Tu_API_Secret"
-
 # Parámetros de la Sonda
 ACTIVOS = ['SOL/USDT', 'BTC/USDT']  
 TIMEFRAME = '5m'       
