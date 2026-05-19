@@ -607,17 +607,24 @@ def cerrar_parcial(pos: Posicion, precio_scan: float, motivo: str) -> None:
     enviar_telegram(msg)
 
 def cerrar_posicion(pos: Posicion, precio_scan: float, motivo: str) -> None:
-    # SL fijo → usar precio exacto del SL; Trail-SL y TP2 → precio del scan
-    if motivo == "SL":
+    # Usar precio exacto del nivel que se tocó — evita inflación por delay del scan
+    if motivo in ("SL", "Trail-SL"):
         precio_calc = pos.precio_sl
     elif motivo == "TP2":
         precio_calc = pos.precio_tp2
     else:
-        precio_calc = precio_scan  # Trail-SL usa precio del scan
+        precio_calc = precio_scan
 
     pct    = abs(precio_calc - pos.precio_entrada) / pos.precio_entrada
     factor = (1.0 - TP1_CIERRE_PCT) if pos.tp1_cerrado else 1.0
-    pnl    = pct * pos.tamano_usd * factor * (1 if motivo != "SL" else -1)
+
+    # Signo basado en dirección real del trade, no en el motivo
+    if pos.direccion == "SHORT":
+        signo = 1 if precio_calc < pos.precio_entrada else -1
+    else:
+        signo = 1 if precio_calc > pos.precio_entrada else -1
+
+    pnl = pct * pos.tamano_usd * factor * signo
 
     if DRY_RUN:
         log.info("[DRY-RUN] CERRAR %s %s @ %.4f (%s) | PnL $%.2f",
