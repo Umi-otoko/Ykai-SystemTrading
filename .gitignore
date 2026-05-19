@@ -1,0 +1,19 @@
+# Credenciales — NUNCA subir
+.env
+
+# Estado y logs generados en runtime
+estado_bot.json
+trading.log
+bot.log
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# VSCode
+.vscode/
