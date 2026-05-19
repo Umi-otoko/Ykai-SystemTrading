@@ -275,12 +275,44 @@ estado = EstadoBot()  # se reemplaza en main() con cargar_estado()
 def resetear_si_nuevo_dia() -> None:
     hoy = date.today()
     if estado.fecha != hoy:
+        # Guardar resumen del día antes de resetear
+        _guardar_historial_dia()
         estado.perdida_dia  = 0.0
         estado.ganancia_dia = 0.0
         estado.trades_dia   = 0
         estado.bloqueado    = False
         estado.fecha        = hoy
         log.info("Nuevo día — contadores reseteados")
+
+def _guardar_historial_dia() -> None:
+    historial_archivo = "historial_pnl.json"
+    registro = {
+        "fecha":        estado.fecha.isoformat(),
+        "ganancia":     round(estado.ganancia_dia, 2),
+        "perdida":      round(estado.perdida_dia, 2),
+        "neto":         round(estado.ganancia_dia - estado.perdida_dia, 2),
+        "trades":       estado.trades_dia,
+    }
+    try:
+        historial = []
+        if os.path.exists(historial_archivo):
+            with open(historial_archivo) as f:
+                historial = json.load(f)
+        historial.append(registro)
+        with open(historial_archivo, "w") as f:
+            json.dump(historial, f, indent=2)
+        log.info("Resumen día %s → ganancia: +$%.2f | pérdida: -$%.2f | neto: $%.2f | trades: %d",
+                 registro["fecha"], registro["ganancia"], registro["perdida"],
+                 registro["neto"], registro["trades"])
+        enviar_telegram(
+            f"📅 Cierre día {registro['fecha']}\n"
+            f"Ganancia: +${registro['ganancia']:.2f}\n"
+            f"Pérdida:  -${registro['perdida']:.2f}\n"
+            f"Neto:      ${registro['neto']:+.2f}\n"
+            f"Trades:    {registro['trades']}"
+        )
+    except Exception as e:
+        log.warning("No se pudo guardar historial: %s", e)
 
 def verificar_riesgo() -> bool:
     resetear_si_nuevo_dia()
