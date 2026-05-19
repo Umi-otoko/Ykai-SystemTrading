@@ -1,5 +1,8 @@
 # YKAI Quant Core — TradingBot v2
 
+**© 2026 Ykai. Todos los derechos reservados.**  
+Software privado — uso restringido al autor. No se autoriza copia, distribución ni modificación sin permiso expreso.
+
 Bot de trading algorítmico para Binance USD-M Futures Testnet.  
 Capital objetivo: $50 USD | Riesgo por trade: $1.00 (2%) | Circuit breaker: $3.00 (6%)
 
@@ -121,7 +124,7 @@ Precio bajo EMA200, cruce bajista EMA20/50, RSI 35–60, volumen, tendencia 1h B
 - **Retry con backoff**: toda llamada al exchange tiene 3 reintentos
 - **Circuit breaker**: para el bot si pérdida diaria ≥ $3
 - **Cooldown post-SL**: 1 hora sin re-entrar al mismo símbolo tras una pérdida
-- **Breakeven + trailing**: tras TP1, el SL sigue al mejor precio para asegurar ganancia
+- **Trailing stop**: tras TP1, el SL sigue al mejor precio para asegurar ganancia
 - **Persistencia de estado**: si el bot se reinicia, recupera posiciones abiertas desde `estado_bot.json`
 - **PnL exacto**: usa precio del SL/TP, no el precio del scan (evita inflación por delay)
 
@@ -137,7 +140,11 @@ Precio bajo EMA200, cruce bajista EMA20/50, RSI 35–60, volumen, tendencia 1h B
 
 ---
 
-## Advertencia
+## Contacto
 
-Este bot opera en **testnet** (dinero ficticio). Nunca ha operado con capital real.  
-Antes de activar `DRY_RUN = False` en producción real, verificar resultados en testnet por al menos 2–4 semanas.
+- **GitHub**: [@Umi-otoko](https://github.com/Umi-otoko)
+
+---
+
+> Este bot opera en **testnet** (dinero ficticio). Nunca ha operado con capital real.  
+> Verificar resultados en testnet por al menos 2–4 semanas antes de activar capital real.
