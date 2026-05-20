@@ -27,8 +27,8 @@ DRY_RUN             = True       # ← cambiar a False para órdenes reales en t
 
 CAPITAL_USD         = 50.0
 RIESGO_USD          = 1.0        # $1 por trade = 2% del capital
-MAX_PERDIDA_DIA     = 4.0        # $4 = 8% — circuit breaker (3 posiciones × $1 + margen)
-MAX_TRADES_ABIERTOS = 3          # hasta 3 posiciones simultáneas
+MAX_PERDIDA_DIA     = 3.0        # $3 = CB — con score 5/6 y filtro 4h, 3 SLs = señal de mercado adverso
+MAX_TRADES_ABIERTOS = 2          # máximo 2 posiciones: reduce riesgo correlacionado
 
 LEVERAGE_MIN        = 1          # 1x mínimo — respeta el $1 de riesgo en pares volátiles
 LEVERAGE_MAX        = 15         # 15x máximo — captura el leverage óptimo en pares de bajo ATR%
@@ -39,20 +39,26 @@ EMA_MEDIA           = 50
 EMA_LENTA           = 200
 RSI_PERIODO         = 14
 ATR_PERIODO         = 14
-ATR_MULT            = 1.3        # SL = precio ± (ATR × 1.3)
+ATR_MULT            = 1.5        # SL más amplio — 1.5× ATR filtra ruido de mercado
 VOLUMEN_MULT        = 1.3        # volumen debe ser 1.3× la media
 
 TP1_RATIO           = 1.0        # ratio TP1 (1:1) — cierra TP1_CIERRE_PCT del trade
 TP2_RATIO           = 3.0        # ratio TP2 (3:1) — cierra el resto o trailing stop
-TP1_CIERRE_PCT      = 0.25       # 25% en TP1, 75% sigue con trailing — más capital en el movimiento
-TRAIL_FACTOR        = 0.4        # trailing más ajustado: SL a 0.4× distancia TP1 del mejor precio
-SCORE_MINIMO        = 4          # de 6 condiciones
+TP1_CIERRE_PCT      = 0.25       # 25% en TP1, 75% sigue con trailing
+TRAIL_FACTOR        = 0.4        # trailing: SL a 0.4× distancia TP1 del mejor precio
+SCORE_MINIMO        = 5          # 5/6 condiciones — solo setups de alta convicción
 
 TF_TENDENCIA        = "1h"
+TF_MACRO            = "4h"       # filtro macro — 4h y 1h deben coincidir en dirección
 TF_ENTRADA          = "15m"
-INTERVALO_SCAN      = 20         # 20s — detecta cruces de SL/TP 33% más rápido que antes
+CACHE_MACRO_SECS    = 240        # refrescar tendencia 4h cada 4 minutos
+INTERVALO_SCAN      = 20         # segundos entre ciclos
 
-# Tier S: BTC, ETH, SOL | Tier A: XRP, DOGE, BNB — los 6 con mejor liquidez y volatilidad
+SL_GLOBALES_VENTANA = 30         # minutos — ventana para detectar múltiples SLs
+SL_GLOBALES_MAX     = 2          # si ≥2 SLs en la ventana → pausa global de nueva entrada
+COOLDOWN_SL_SEGUNDOS = 7200      # 2h sin re-entrar al mismo símbolo tras SL (antes 1h)
+
+# Tier S: BTC, ETH, SOL | Tier A: XRP, DOGE, BNB
 ACTIVOS             = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "BNB/USDT"]
 
 # ==============================================================================
@@ -184,8 +190,16 @@ class EstadoBot:
     posiciones:   dict  = field(default_factory=dict)   # simbolo → Posicion
     cooldowns:    dict  = field(default_factory=dict)   # simbolo → datetime fin cooldown
 
-COOLDOWN_SL_SEGUNDOS = 3600  # 1h sin re-entrar al mismo símbolo tras un SL
 ESTADO_ARCHIVO       = "estado_bot.json"
+
+# Caché de tendencia 4h (no llamar a la API en cada ciclo de 20s)
+_cache_macro: dict = {}   # simbolo → (datetime, "ALCISTA"|"BAJISTA"|"NEUTRAL")
+
+# Registro de SLs recientes para pausa global
+_sl_recientes: list = []  # lista de datetime de SLs
+
+# Control spam log CB
+_ultimo_aviso_cb: datetime = datetime(2000, 1, 1)
 
 # ==============================================================================
 # PERSISTENCIA DE ESTADO
@@ -322,19 +336,51 @@ def _guardar_historial_dia() -> None:
         log.warning("No se pudo guardar historial: %s", e)
 
 def verificar_riesgo() -> bool:
+    global _ultimo_aviso_cb
     resetear_si_nuevo_dia()
+
     if estado.bloqueado:
-        log.warning("Bot bloqueado — circuit breaker activo")
+        # Anti-spam: logear el aviso solo 1 vez cada 30 minutos
+        ahora = datetime.now(timezone.utc).replace(tzinfo=None)
+        if (ahora - _ultimo_aviso_cb).total_seconds() > 1800:
+            log.warning("Bot bloqueado — circuit breaker activo (pérdida: $%.2f)", estado.perdida_dia)
+            _ultimo_aviso_cb = ahora
         return False
+
     if estado.perdida_dia >= MAX_PERDIDA_DIA:
         estado.bloqueado = True
-        msg = f"⛔ CIRCUIT BREAKER — pérdida diaria ${estado.perdida_dia:.2f} ≥ ${MAX_PERDIDA_DIA}. Bot pausado."
+        msg = f"⛔ CIRCUIT BREAKER — pérdida diaria ${estado.perdida_dia:.2f} ≥ ${MAX_PERDIDA_DIA}. Bot pausado hasta mañana."
         log.warning(msg)
         enviar_telegram(msg)
+        _ultimo_aviso_cb = datetime.now(timezone.utc).replace(tzinfo=None)
         return False
+
     if len(estado.posiciones) >= MAX_TRADES_ABIERTOS:
-        return False  # silencioso — no spamear el log
+        return False  # silencioso
+
+    # Pausa global: si hay ≥ SL_GLOBALES_MAX SLs en los últimos SL_GLOBALES_VENTANA min
+    if _pausa_global_activa():
+        log.debug("Pausa global activa — %d SLs en los últimos %dmin", len(_sl_recientes), SL_GLOBALES_VENTANA)
+        return False
+
     return True
+
+def _pausa_global_activa() -> bool:
+    """True si se detectaron múltiples SLs recientes — señal de mercado adverso."""
+    from datetime import timedelta
+    ahora = datetime.now(timezone.utc).replace(tzinfo=None)
+    ventana = ahora - timedelta(minutes=SL_GLOBALES_VENTANA)
+    recientes = [t for t in _sl_recientes if t > ventana]
+    return len(recientes) >= SL_GLOBALES_MAX
+
+def _registrar_sl_global() -> None:
+    """Registrar un SL para el detector de múltiples pérdidas."""
+    _sl_recientes.append(datetime.now(timezone.utc).replace(tzinfo=None))
+    # Mantener solo últimas 24h para no crecer indefinidamente
+    from datetime import timedelta
+    corte = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=24)
+    while _sl_recientes and _sl_recientes[0] < corte:
+        _sl_recientes.pop(0)
 
 def en_cooldown(simbolo: str) -> bool:
     fin = estado.cooldowns.get(simbolo)
@@ -346,8 +392,8 @@ def activar_cooldown(simbolo: str) -> None:
     from datetime import timedelta
     fin = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=COOLDOWN_SL_SEGUNDOS)
     estado.cooldowns[simbolo] = fin
-    log.info("Cooldown activado en %s por %dm — no re-entra hasta %s",
-             simbolo, COOLDOWN_SL_SEGUNDOS // 60, fin.strftime("%H:%M"))
+    log.info("Cooldown activado en %s por %dh — no re-entra hasta %s",
+             simbolo, COOLDOWN_SL_SEGUNDOS // 3600, fin.strftime("%H:%M"))
 
 # ==============================================================================
 # CÁLCULOS DE INDICADORES
@@ -412,6 +458,30 @@ def obtener_tendencia_1h(simbolo: str) -> str:
         log.warning("Error tendencia 1h %s: %s", simbolo, e)
         return "NEUTRAL"
 
+def obtener_tendencia_macro(simbolo: str) -> str:
+    """Tendencia en 4h con caché — no llama a la API en cada ciclo de 20s."""
+    from datetime import timedelta
+    ahora = datetime.now(timezone.utc).replace(tzinfo=None)
+    cached = _cache_macro.get(simbolo)
+    if cached:
+        ts, valor = cached
+        if (ahora - ts).total_seconds() < CACHE_MACRO_SECS:
+            return valor
+    try:
+        df = calcular_indicadores(obtener_velas(simbolo, TF_MACRO, 100))
+        u  = df.iloc[-1]
+        if u["ema20"] > u["ema50"] > u["ema200"]:
+            tendencia = "ALCISTA"
+        elif u["ema20"] < u["ema50"] < u["ema200"]:
+            tendencia = "BAJISTA"
+        else:
+            tendencia = "NEUTRAL"
+    except Exception as e:
+        log.warning("Error tendencia 4h %s: %s", simbolo, e)
+        tendencia = "NEUTRAL"
+    _cache_macro[simbolo] = (ahora, tendencia)
+    return tendencia
+
 # ==============================================================================
 # CÁLCULO DE LEVERAGE Y STOPS
 # ==============================================================================
@@ -445,6 +515,9 @@ def evaluar_senal(simbolo: str) -> Senal | None:
     precio = float(curr["close"])
     atr    = float(curr["atr"])
 
+    # Tendencia macro (4h) — con caché para no sobrecargar la API
+    tendencia_4h = obtener_tendencia_macro(simbolo)
+
     # ── LONG ────────────────────────────────────────────────────────────────
     sl_long  = precio - atr * ATR_MULT
     tp1_long = precio + (precio - sl_long) * TP1_RATIO
@@ -455,18 +528,19 @@ def evaluar_senal(simbolo: str) -> Senal | None:
     c3 = 40 <= curr["rsi"] <= 65
     c4 = curr["volume"] > curr["vol_med"] * VOLUMEN_MULT
     c5 = curr["low"] >= curr["ema20"] * 0.998
-    c6 = tendencia_1h == "ALCISTA"
+    # c6: doble confirmación — 1h Y 4h alcistas (evita operar contra la macro)
+    c6 = tendencia_1h == "ALCISTA" and tendencia_4h == "ALCISTA"
 
     score_long = sum([c1, c2, c3, c4, c5, c6])
 
     if score_long >= SCORE_MINIMO:
         lev = calcular_leverage_optimo(precio, sl_long)
-        log.info("SEÑAL LONG %s | score %d/6 | precio %.4f | SL %.4f | TP1 %.4f | TP2 %.4f | lev %dx",
-                 simbolo, score_long, precio, sl_long, tp1_long, tp2_long, lev)
+        log.info("SEÑAL LONG %s | score %d/6 | 1h:%s 4h:%s | precio %.4f | SL %.4f | TP1 %.4f | lev %dx",
+                 simbolo, score_long, tendencia_1h, tendencia_4h, precio, sl_long, tp1_long, lev)
         return Senal(simbolo, "LONG", score_long, precio, sl_long, tp1_long, tp2_long, lev, atr)
     elif score_long == SCORE_MINIMO - 1:
-        log.debug("Cerca LONG %s | score %d/6 | RSI %.1f | tendencia 1h: %s",
-                  simbolo, score_long, curr["rsi"], tendencia_1h)
+        log.debug("Cerca LONG %s | score %d/6 | 1h:%s 4h:%s | RSI %.1f",
+                  simbolo, score_long, tendencia_1h, tendencia_4h, curr["rsi"])
 
     # ── SHORT ───────────────────────────────────────────────────────────────
     sl_short  = precio + atr * ATR_MULT
@@ -478,18 +552,19 @@ def evaluar_senal(simbolo: str) -> Senal | None:
     d3 = 35 <= curr["rsi"] <= 60
     d4 = curr["volume"] > curr["vol_med"] * VOLUMEN_MULT
     d5 = curr["high"] <= curr["ema20"] * 1.002
-    d6 = tendencia_1h == "BAJISTA"
+    # d6: doble confirmación — 1h Y 4h bajistas (evita shorts en tendencia macro alcista)
+    d6 = tendencia_1h == "BAJISTA" and tendencia_4h == "BAJISTA"
 
     score_short = sum([d1, d2, d3, d4, d5, d6])
 
     if score_short >= SCORE_MINIMO:
         lev = calcular_leverage_optimo(precio, sl_short)
-        log.info("SEÑAL SHORT %s | score %d/6 | precio %.4f | SL %.4f | TP1 %.4f | TP2 %.4f | lev %dx",
-                 simbolo, score_short, precio, sl_short, tp1_short, tp2_short, lev)
+        log.info("SEÑAL SHORT %s | score %d/6 | 1h:%s 4h:%s | precio %.4f | SL %.4f | TP1 %.4f | lev %dx",
+                 simbolo, score_short, tendencia_1h, tendencia_4h, precio, sl_short, tp1_short, lev)
         return Senal(simbolo, "SHORT", score_short, precio, sl_short, tp1_short, tp2_short, lev, atr)
     elif score_short == SCORE_MINIMO - 1:
-        log.debug("Cerca SHORT %s | score %d/6 | RSI %.1f | tendencia 1h: %s",
-                  simbolo, score_short, curr["rsi"], tendencia_1h)
+        log.debug("Cerca SHORT %s | score %d/6 | 1h:%s 4h:%s | RSI %.1f",
+                  simbolo, score_short, tendencia_1h, tendencia_4h, curr["rsi"])
 
     return None
 
@@ -699,6 +774,7 @@ def cerrar_posicion(pos: Posicion, precio_scan: float, motivo: str) -> None:
         estado.perdida_dia  += abs(pnl)
         if motivo == "SL":
             activar_cooldown(pos.simbolo)
+            _registrar_sl_global()  # detectar rachas de pérdidas para pausa global
 
     emoji = "✅" if motivo != "SL" else "❌"
     msg   = f"{emoji} {motivo} {pos.simbolo} @ {precio_calc:.4f} | PnL ${pnl:+.2f} | Día: +${estado.ganancia_dia:.2f} / -${estado.perdida_dia:.2f}"
@@ -769,7 +845,7 @@ def main() -> None:
     estado = cargar_estado()
     modo = "DRY-RUN (simulación)" if DRY_RUN else "⚠️  REAL EN TESTNET"
     log.info("=" * 60)
-    log.info("YKAI TradingBot v2.3 iniciado — modo: %s", modo)
+    log.info("YKAI TradingBot v2.5 iniciado — modo: %s", modo)
     log.info("Capital: $%.2f | Riesgo/trade: $%.2f | CB: $%.2f", CAPITAL_USD, RIESGO_USD, MAX_PERDIDA_DIA)
     log.info("Activos (%d): %s", len(ACTIVOS), ", ".join(ACTIVOS))
     log.info("Max posiciones: %d | Score mínimo: %d/6 | Trail factor: %.1f",
