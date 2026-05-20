@@ -27,8 +27,8 @@ DRY_RUN             = True       # ← cambiar a False para órdenes reales en t
 
 CAPITAL_USD         = 50.0
 RIESGO_USD          = 1.0        # $1 por trade = 2% del capital
-MAX_PERDIDA_DIA     = 3.0        # $3 = 6% — circuit breaker
-MAX_TRADES_ABIERTOS = 2
+MAX_PERDIDA_DIA     = 4.0        # $4 = 8% — circuit breaker (ajustado a 3 posiciones)
+MAX_TRADES_ABIERTOS = 3          # hasta 3 posiciones simultáneas (antes: 2)
 
 LEVERAGE_MIN        = 2
 LEVERAGE_MAX        = 10
@@ -51,21 +51,27 @@ TF_TENDENCIA        = "1h"
 TF_ENTRADA          = "15m"
 INTERVALO_SCAN      = 30         # segundos entre ciclos
 
-ACTIVOS             = ["BTC/USDT", "SOL/USDT", "ETH/USDT"]
+# 6 activos — alta liquidez en Binance Futures Testnet
+ACTIVOS             = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "AVAX/USDT", "LINK/USDT"]
 
 # ==============================================================================
 # LOGGING
 # ==============================================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("trading.log", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+_file_handler = logging.FileHandler("trading.log", encoding="utf-8")
+_file_handler.setLevel(logging.INFO)   # archivo: solo INFO+
+_file_handler.setFormatter(_fmt)
+
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.DEBUG)  # consola: DEBUG también (near-misses)
+_console_handler.setFormatter(_fmt)
+
 log = logging.getLogger(__name__)
+log.setLevel(logging.DEBUG)
+log.addHandler(_file_handler)
+log.addHandler(_console_handler)
 
 # ==============================================================================
 # EXCHANGE — testnet Binance USD-M Futures
@@ -457,6 +463,9 @@ def evaluar_senal(simbolo: str) -> Senal | None:
         log.info("SEÑAL LONG %s | score %d/6 | precio %.4f | SL %.4f | TP1 %.4f | TP2 %.4f | lev %dx",
                  simbolo, score_long, precio, sl_long, tp1_long, tp2_long, lev)
         return Senal(simbolo, "LONG", score_long, precio, sl_long, tp1_long, tp2_long, lev, atr)
+    elif score_long == SCORE_MINIMO - 1:
+        log.debug("Cerca LONG %s | score %d/6 | RSI %.1f | tendencia 1h: %s",
+                  simbolo, score_long, curr["rsi"], tendencia_1h)
 
     # ── SHORT ───────────────────────────────────────────────────────────────
     sl_short  = precio + atr * ATR_MULT
@@ -477,6 +486,9 @@ def evaluar_senal(simbolo: str) -> Senal | None:
         log.info("SEÑAL SHORT %s | score %d/6 | precio %.4f | SL %.4f | TP1 %.4f | TP2 %.4f | lev %dx",
                  simbolo, score_short, precio, sl_short, tp1_short, tp2_short, lev)
         return Senal(simbolo, "SHORT", score_short, precio, sl_short, tp1_short, tp2_short, lev, atr)
+    elif score_short == SCORE_MINIMO - 1:
+        log.debug("Cerca SHORT %s | score %d/6 | RSI %.1f | tendencia 1h: %s",
+                  simbolo, score_short, curr["rsi"], tendencia_1h)
 
     return None
 
@@ -746,16 +758,18 @@ def main() -> None:
     estado = cargar_estado()
     modo = "DRY-RUN (simulación)" if DRY_RUN else "⚠️  REAL EN TESTNET"
     log.info("=" * 60)
-    log.info("YKAI TradingBot v2 iniciado — modo: %s", modo)
+    log.info("YKAI TradingBot v2.3 iniciado — modo: %s", modo)
     log.info("Capital: $%.2f | Riesgo/trade: $%.2f | CB: $%.2f", CAPITAL_USD, RIESGO_USD, MAX_PERDIDA_DIA)
-    log.info("Activos: %s", ", ".join(ACTIVOS))
+    log.info("Activos (%d): %s", len(ACTIVOS), ", ".join(ACTIVOS))
+    log.info("Max posiciones: %d | Score mínimo: %d/6 | Trail factor: %.1f",
+             MAX_TRADES_ABIERTOS, SCORE_MINIMO, TRAIL_FACTOR)
     log.info("Scan cada %ds | TF tendencia: %s | TF entrada: %s", INTERVALO_SCAN, TF_TENDENCIA, TF_ENTRADA)
     log.info("=" * 60)
 
     enviar_telegram(
         f"🤖 YKAI Bot iniciado [{modo}]\n"
-        f"Activos: {', '.join(ACTIVOS)}\n"
-        f"Riesgo/trade: $1.00 | CB: $3.00"
+        f"Activos ({len(ACTIVOS)}): {', '.join(a.split('/')[0] for a in ACTIVOS)}\n"
+        f"Max trades: {MAX_TRADES_ABIERTOS} | Riesgo/trade: $1.00 | CB: ${MAX_PERDIDA_DIA:.2f}"
     )
 
     while True:

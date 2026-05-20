@@ -4,7 +4,7 @@
 Software privado — uso restringido al autor. No se autoriza copia, distribución ni modificación sin permiso expreso.
 
 Bot de trading algorítmico para Binance USD-M Futures Testnet.  
-Capital objetivo: $50 USD | Riesgo por trade: $1.00 (2%) | Circuit breaker: $3.00 (6%)
+Capital objetivo: $50 USD | Riesgo por trade: $1.00 (2%) | Circuit breaker: $4.00 (8%) | Activos: 6
 
 ---
 
@@ -16,7 +16,8 @@ Capital objetivo: $50 USD | Riesgo por trade: $1.00 (2%) | Circuit breaker: $3.0
 - **Leverage automático**: calculado para que la pérdida sea siempre exactamente $1.00
 - **TPs escalonados**: cierra 30% en TP1 (1:1) → trailing stop activo → TP2 (3:1)
 - **Trailing stop**: tras TP1, el SL sigue al mejor precio visto (TRAIL_FACTOR = 0.5)
-- **Circuit breaker**: $3 de pérdida diaria → bot pausado automáticamente
+- **Circuit breaker**: $4 de pérdida diaria → bot pausado automáticamente
+- **Near-miss logging**: muestra en consola activos con score 3/6 (un paso de entrar)
 
 ### Fórmula de leverage
 
@@ -85,8 +86,8 @@ Cambiar en la línea 25 de `TradingBot_v2.py`.
 ```python
 CAPITAL_USD         = 50.0
 RIESGO_USD          = 1.0        # $1 por trade = 2%
-MAX_PERDIDA_DIA     = 3.0        # circuit breaker
-MAX_TRADES_ABIERTOS = 2
+MAX_PERDIDA_DIA     = 4.0        # circuit breaker (ajustado a 3 posiciones)
+MAX_TRADES_ABIERTOS = 3          # posiciones simultáneas
 
 ATR_MULT            = 1.3        # multiplicador para el stop loss
 TP1_RATIO           = 1.0        # ratio del primer target
@@ -95,7 +96,7 @@ TP1_CIERRE_PCT      = 0.30       # % de posición que cierra en TP1
 TRAIL_FACTOR        = 0.5        # agresividad del trailing stop post-TP1
 
 SCORE_MINIMO        = 4          # condiciones mínimas para entrar (de 6)
-ACTIVOS             = ["BTC/USDT", "SOL/USDT", "ETH/USDT"]
+ACTIVOS             = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "AVAX/USDT", "LINK/USDT"]
 INTERVALO_SCAN      = 30         # segundos entre ciclos
 ```
 
@@ -137,6 +138,7 @@ Precio bajo EMA200, cruce bajista EMA20/50, RSI 35–60, volumen, tendencia 1h B
 | v2.0 | Bot original reconstruido con auto-leverage, multi-TF, score 6 condiciones |
 | v2.1 | Fix PnL exacto en SL/TP, breakeven automático tras TP1, cooldown post-SL |
 | v2.2 | Persistencia de estado en JSON, trailing stop dinámico, TP2 bajado a 3:1 |
+| v2.3 | 6 activos (BTC, ETH, SOL, BNB, AVAX, LINK), MAX_TRADES=3, CB=$4, near-miss logging |
 
 ---
 
