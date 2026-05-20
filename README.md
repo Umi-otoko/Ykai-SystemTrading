@@ -86,18 +86,22 @@ Cambiar en la línea 25 de `TradingBot_v2.py`.
 ```python
 CAPITAL_USD         = 50.0
 RIESGO_USD          = 1.0        # $1 por trade = 2%
-MAX_PERDIDA_DIA     = 4.0        # circuit breaker (ajustado a 3 posiciones)
+MAX_PERDIDA_DIA     = 4.0        # circuit breaker (3 posiciones + margen)
 MAX_TRADES_ABIERTOS = 3          # posiciones simultáneas
 
+LEVERAGE_MIN        = 1          # 1x mín — respeta $1 riesgo en pares muy volátiles
+LEVERAGE_MAX        = 15         # 15x máx — captura leverage óptimo en pares de bajo ATR%
+TAMANO_MINIMO_USD   = 15.0       # ignora señales con posición < $15
+
 ATR_MULT            = 1.3        # multiplicador para el stop loss
-TP1_RATIO           = 1.0        # ratio del primer target
-TP2_RATIO           = 3.0        # ratio del segundo target
-TP1_CIERRE_PCT      = 0.30       # % de posición que cierra en TP1
-TRAIL_FACTOR        = 0.5        # agresividad del trailing stop post-TP1
+TP1_RATIO           = 1.0        # ratio del primer target (1:1)
+TP2_RATIO           = 3.0        # ratio del segundo target (3:1)
+TP1_CIERRE_PCT      = 0.25       # 25% cierra en TP1, 75% sigue con trailing
+TRAIL_FACTOR        = 0.4        # trailing ajustado: 0.4× distancia TP1
 
 SCORE_MINIMO        = 4          # condiciones mínimas para entrar (de 6)
-ACTIVOS             = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "AVAX/USDT", "LINK/USDT"]
-INTERVALO_SCAN      = 30         # segundos entre ciclos
+ACTIVOS             = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "BNB/USDT"]
+INTERVALO_SCAN      = 20         # segundos entre ciclos (antes 30s)
 ```
 
 ---
@@ -139,6 +143,7 @@ Precio bajo EMA200, cruce bajista EMA20/50, RSI 35–60, volumen, tendencia 1h B
 | v2.1 | Fix PnL exacto en SL/TP, breakeven automático tras TP1, cooldown post-SL |
 | v2.2 | Persistencia de estado en JSON, trailing stop dinámico, TP2 bajado a 3:1 |
 | v2.3 | 6 activos (BTC, ETH, SOL, BNB, AVAX, LINK), MAX_TRADES=3, CB=$4, near-miss logging |
+| v2.4 | Activos Tier A (XRP, DOGE, BNB), leverage 1-15x, trail 0.4, TP1 25%, scan 20s, tamaño exacto $1 riesgo |
 
 ---
 

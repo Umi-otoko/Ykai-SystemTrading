@@ -27,32 +27,33 @@ DRY_RUN             = True       # ← cambiar a False para órdenes reales en t
 
 CAPITAL_USD         = 50.0
 RIESGO_USD          = 1.0        # $1 por trade = 2% del capital
-MAX_PERDIDA_DIA     = 4.0        # $4 = 8% — circuit breaker (ajustado a 3 posiciones)
-MAX_TRADES_ABIERTOS = 3          # hasta 3 posiciones simultáneas (antes: 2)
+MAX_PERDIDA_DIA     = 4.0        # $4 = 8% — circuit breaker (3 posiciones × $1 + margen)
+MAX_TRADES_ABIERTOS = 3          # hasta 3 posiciones simultáneas
 
-LEVERAGE_MIN        = 2
-LEVERAGE_MAX        = 10
+LEVERAGE_MIN        = 1          # 1x mínimo — respeta el $1 de riesgo en pares volátiles
+LEVERAGE_MAX        = 15         # 15x máximo — captura el leverage óptimo en pares de bajo ATR%
+TAMANO_MINIMO_USD   = 15.0       # descarta trades con posición < $15 (evita polvo)
 
 EMA_RAPIDA          = 20
 EMA_MEDIA           = 50
 EMA_LENTA           = 200
 RSI_PERIODO         = 14
 ATR_PERIODO         = 14
-ATR_MULT            = 1.3        # SL = precio ± (ATR × 1.3) — más ajustado, mejor R:R
+ATR_MULT            = 1.3        # SL = precio ± (ATR × 1.3)
 VOLUMEN_MULT        = 1.3        # volumen debe ser 1.3× la media
 
-TP1_RATIO           = 1.0        # cierra 30% aquí
-TP2_RATIO           = 3.0        # cierra 70% restante aquí (bajado de 4.0 — más alcanzable)
-TP1_CIERRE_PCT      = 0.30       # porcentaje de la posición que se cierra en TP1
-TRAIL_FACTOR        = 0.5        # trailing SL = mejor_precio ± (distancia_tp1 × 0.5)
+TP1_RATIO           = 1.0        # ratio TP1 (1:1) — cierra TP1_CIERRE_PCT del trade
+TP2_RATIO           = 3.0        # ratio TP2 (3:1) — cierra el resto o trailing stop
+TP1_CIERRE_PCT      = 0.25       # 25% en TP1, 75% sigue con trailing — más capital en el movimiento
+TRAIL_FACTOR        = 0.4        # trailing más ajustado: SL a 0.4× distancia TP1 del mejor precio
 SCORE_MINIMO        = 4          # de 6 condiciones
 
 TF_TENDENCIA        = "1h"
 TF_ENTRADA          = "15m"
-INTERVALO_SCAN      = 30         # segundos entre ciclos
+INTERVALO_SCAN      = 20         # 20s — detecta cruces de SL/TP 33% más rápido que antes
 
-# 6 activos — alta liquidez en Binance Futures Testnet
-ACTIVOS             = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "AVAX/USDT", "LINK/USDT"]
+# Tier S: BTC, ETH, SOL | Tier A: XRP, DOGE, BNB — los 6 con mejor liquidez y volatilidad
+ACTIVOS             = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "BNB/USDT"]
 
 # ==============================================================================
 # LOGGING
@@ -511,23 +512,33 @@ def abrir_posicion(senal: Senal) -> None:
         log.info("Cooldown activo en %s — señal ignorada", senal.simbolo)
         return
 
-    tamano_usd  = CAPITAL_USD * senal.leverage * (RIESGO_USD / (CAPITAL_USD * abs(senal.precio - senal.sl) / senal.precio))
-    tamano_usd  = min(tamano_usd, CAPITAL_USD * senal.leverage)
-    cantidad    = tamano_usd / senal.precio
-    lado        = "buy" if senal.direccion == "LONG" else "sell"
+    # Tamaño exacto que hace PnL(SL) = RIESGO_USD
+    # tamano = riesgo / distancia_sl_pct  →  SL hit = distancia_sl_pct × tamano = $1
+    distancia_sl_pct = abs(senal.precio - senal.sl) / senal.precio
+    tamano_usd       = RIESGO_USD / distancia_sl_pct if distancia_sl_pct > 0 else 0.0
+    # No exceder el capital disponible apalancado
+    tamano_usd       = min(tamano_usd, CAPITAL_USD * senal.leverage)
+
+    if tamano_usd < TAMANO_MINIMO_USD:
+        log.debug("Posición demasiado pequeña en %s (%.2f USD) — señal ignorada", senal.simbolo, tamano_usd)
+        return
+
+    cantidad = tamano_usd / senal.precio
+    lado     = "buy" if senal.direccion == "LONG" else "sell"
 
     if DRY_RUN:
         log.info("[DRY-RUN] ABRIR %s %s | qty=%.4f | precio=%.4f | lev=%dx | SL=%.4f | TP1=%.4f | TP2=%.4f",
                  senal.direccion, senal.simbolo, cantidad, senal.precio, senal.leverage,
                  senal.sl, senal.tp1, senal.tp2)
+        ganancia_tp1   = tamano_usd * abs(senal.tp1 - senal.precio) / senal.precio * TP1_CIERRE_PCT
+        ganancia_tp2   = tamano_usd * abs(senal.tp2 - senal.precio) / senal.precio * (1 - TP1_CIERRE_PCT)
         msg = (
             f"📊 [DRY-RUN] {senal.direccion} {senal.simbolo}\n"
-            f"Precio: {senal.precio:.4f}\n"
-            f"SL: {senal.sl:.4f}\n"
-            f"TP1 ({int(TP1_CIERRE_PCT*100)}%): {senal.tp1:.4f} → +${RIESGO_USD * TP1_RATIO * TP1_CIERRE_PCT:.2f}\n"
-            f"TP2 ({int((1-TP1_CIERRE_PCT)*100)}%): {senal.tp2:.4f} → +${RIESGO_USD * TP2_RATIO * (1-TP1_CIERRE_PCT):.2f}\n"
-            f"Leverage: {senal.leverage}x | Score: {senal.score}/6\n"
-            f"Pérdida máx: -$1.00 | Ganancia total esperada: +${RIESGO_USD*(TP1_RATIO*TP1_CIERRE_PCT + TP2_RATIO*(1-TP1_CIERRE_PCT)):.2f}"
+            f"Precio: {senal.precio:.4f} | Lev: {senal.leverage}x | Score: {senal.score}/6\n"
+            f"SL:  {senal.sl:.4f}  → máx -$1.00\n"
+            f"TP1 ({int(TP1_CIERRE_PCT*100)}%): {senal.tp1:.4f} → +${ganancia_tp1:.2f}\n"
+            f"TP2 ({int((1-TP1_CIERRE_PCT)*100)}%): {senal.tp2:.4f} → +${ganancia_tp2:.2f}\n"
+            f"Posición: ${tamano_usd:.0f} | Ganancia completa esperada: +${ganancia_tp1+ganancia_tp2:.2f}"
         )
         enviar_telegram(msg)
     else:
