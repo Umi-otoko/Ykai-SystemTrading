@@ -144,6 +144,8 @@ Precio bajo EMA200, cruce bajista EMA20/50, RSI 35–60, volumen, tendencia 1h B
 | v2.2 | Persistencia de estado en JSON, trailing stop dinámico, TP2 bajado a 3:1 |
 | v2.3 | 6 activos (BTC, ETH, SOL, BNB, AVAX, LINK), MAX_TRADES=3, CB=$4, near-miss logging |
 | v2.4 | Activos Tier A (XRP, DOGE, BNB), leverage 1-15x, trail 0.4, TP1 25%, scan 20s, tamaño exacto $1 riesgo |
+| v2.5 | Filtro macro 4h (c6/d6 dual), score mínimo 5/6, MAX_TRADES=2, pausa global 2 SLs/30min, cooldown 2h |
+| v2.6 | Precisión: ATR mínimo 0.12%, volumen 1.5x, RSI SHORT 38-55, LONG 42-60, EMA gap 0.02%, vela confirmada, cap estado |
 
 ---
 

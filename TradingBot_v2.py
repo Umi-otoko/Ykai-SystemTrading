@@ -27,7 +27,7 @@ DRY_RUN             = True       # ← cambiar a False para órdenes reales en t
 
 CAPITAL_USD         = 50.0
 RIESGO_USD          = 1.0        # $1 por trade = 2% del capital
-MAX_PERDIDA_DIA     = 3.0        # $3 = CB — con score 5/6 y filtro 4h, 3 SLs = señal de mercado adverso
+MAX_PERDIDA_DIA     = 10.0        # $3 = CB — con score 5/6 y filtro 4h, 3 SLs = señal de mercado adverso
 MAX_TRADES_ABIERTOS = 2          # máximo 2 posiciones: reduce riesgo correlacionado
 
 LEVERAGE_MIN        = 1          # 1x mínimo — respeta el $1 de riesgo en pares volátiles
@@ -40,7 +40,8 @@ EMA_LENTA           = 200
 RSI_PERIODO         = 14
 ATR_PERIODO         = 14
 ATR_MULT            = 1.5        # SL más amplio — 1.5× ATR filtra ruido de mercado
-VOLUMEN_MULT        = 1.3        # volumen debe ser 1.3× la media
+VOLUMEN_MULT        = 1.5        # volumen debe ser 1.5× la media (más estricto = menos falsos positivos)
+ATR_MIN_PCT         = 0.0012     # ATR mínimo 0.12% del precio — descarta mercados planos/chop
 
 TP1_RATIO           = 1.0        # ratio TP1 (1:1) — cierra TP1_CIERRE_PCT del trade
 TP2_RATIO           = 3.0        # ratio TP2 (3:1) — cierra el resto o trailing stop
@@ -279,6 +280,15 @@ def cargar_estado() -> "EstadoBot":
             if fin > ahora:
                 est.cooldowns[sym] = fin
 
+        # Validación: si el estado guardado tenía más posiciones que el límite actual,
+        # conservar solo las más recientes (evita el bug de "5 posiciones con MAX=2")
+        if len(est.posiciones) > MAX_TRADES_ABIERTOS:
+            todas = sorted(est.posiciones.items(), key=lambda x: x[1].timestamp, reverse=True)
+            descartadas = [s for s, _ in todas[MAX_TRADES_ABIERTOS:]]
+            est.posiciones = dict(todas[:MAX_TRADES_ABIERTOS])
+            log.warning("Estado cargado con %d posiciones (máximo %d) — descartadas: %s",
+                        len(todas), MAX_TRADES_ABIERTOS, ", ".join(descartadas))
+
         if est.posiciones:
             log.info("Estado recuperado: %d posiciones abiertas | pérdida día: $%.2f",
                      len(est.posiciones), est.perdida_dia)
@@ -515,6 +525,15 @@ def evaluar_senal(simbolo: str) -> Senal | None:
     precio = float(curr["close"])
     atr    = float(curr["atr"])
 
+    # ── FILTRO ATR MÍNIMO ────────────────────────────────────────────────────
+    # Mercados con ATR < 0.12% del precio son demasiado planos — las señales
+    # no tienen momentum real y el SL se toca por ruido aleatorio
+    atr_pct = atr / precio
+    if atr_pct < ATR_MIN_PCT:
+        log.debug("ATR plano %s (%.3f%%) < %.3f%% mínimo — mercado sin momentum, señal descartada",
+                  simbolo, atr_pct * 100, ATR_MIN_PCT * 100)
+        return None
+
     # Tendencia macro (4h) — con caché para no sobrecargar la API
     tendencia_4h = obtener_tendencia_macro(simbolo)
 
@@ -523,11 +542,17 @@ def evaluar_senal(simbolo: str) -> Senal | None:
     tp1_long = precio + (precio - sl_long) * TP1_RATIO
     tp2_long = precio + (precio - sl_long) * TP2_RATIO
 
+    # gap EMA para c2: cruce válido solo si hay separación real (evita cruces de ruido)
+    ema_gap_long = (curr["ema20"] - curr["ema50"]) / curr["ema50"]
+
     c1 = precio > curr["ema200"]
-    c2 = (prev["ema20"] <= prev["ema50"]) and (curr["ema20"] > curr["ema50"])
-    c3 = 40 <= curr["rsi"] <= 65
+    # c2: cruce EMA20 sobre EMA50 + separación mínima 0.02% (filtra cruces "de roce")
+    c2 = (prev["ema20"] <= prev["ema50"]) and (curr["ema20"] > curr["ema50"]) and (ema_gap_long >= 0.0002)
+    # c3: RSI en zona neutral-alcista — evita entrar cerca de sobrecompra (antes 40-65)
+    c3 = 42 <= curr["rsi"] <= 60
     c4 = curr["volume"] > curr["vol_med"] * VOLUMEN_MULT
-    c5 = curr["low"] >= curr["ema20"] * 0.998
+    # c5: pullback controlado + vela alcista (close > open) — confirma dirección
+    c5 = (curr["low"] >= curr["ema20"] * 0.998) and (curr["close"] > curr["open"])
     # c6: doble confirmación — 1h Y 4h alcistas (evita operar contra la macro)
     c6 = tendencia_1h == "ALCISTA" and tendencia_4h == "ALCISTA"
 
@@ -547,11 +572,17 @@ def evaluar_senal(simbolo: str) -> Senal | None:
     tp1_short = precio - (sl_short - precio) * TP1_RATIO
     tp2_short = precio - (sl_short - precio) * TP2_RATIO
 
+    # gap EMA para d2: cruce válido solo si hay separación real
+    ema_gap_short = (curr["ema50"] - curr["ema20"]) / curr["ema50"]
+
     d1 = precio < curr["ema200"]
-    d2 = (prev["ema20"] >= prev["ema50"]) and (curr["ema20"] < curr["ema50"])
-    d3 = 35 <= curr["rsi"] <= 60
+    # d2: cruce EMA20 bajo EMA50 + separación mínima 0.02% (filtra cruces de ruido en chop)
+    d2 = (prev["ema20"] >= prev["ema50"]) and (curr["ema20"] < curr["ema50"]) and (ema_gap_short >= 0.0002)
+    # d3: RSI en zona neutral-bajista — RSI > 55 indica momentum aún alcista, evitar SHORT
+    d3 = 38 <= curr["rsi"] <= 55
     d4 = curr["volume"] > curr["vol_med"] * VOLUMEN_MULT
-    d5 = curr["high"] <= curr["ema20"] * 1.002
+    # d5: precio pegado a EMA20 + vela bajista (close < open) — confirma dirección
+    d5 = (curr["high"] <= curr["ema20"] * 1.002) and (curr["close"] < curr["open"])
     # d6: doble confirmación — 1h Y 4h bajistas (evita shorts en tendencia macro alcista)
     d6 = tendencia_1h == "BAJISTA" and tendencia_4h == "BAJISTA"
 
@@ -845,7 +876,7 @@ def main() -> None:
     estado = cargar_estado()
     modo = "DRY-RUN (simulación)" if DRY_RUN else "⚠️  REAL EN TESTNET"
     log.info("=" * 60)
-    log.info("YKAI TradingBot v2.5 iniciado — modo: %s", modo)
+    log.info("YKAI TradingBot v2.6 iniciado — modo: %s", modo)
     log.info("Capital: $%.2f | Riesgo/trade: $%.2f | CB: $%.2f", CAPITAL_USD, RIESGO_USD, MAX_PERDIDA_DIA)
     log.info("Activos (%d): %s", len(ACTIVOS), ", ".join(ACTIVOS))
     log.info("Max posiciones: %d | Score mínimo: %d/6 | Trail factor: %.1f",
