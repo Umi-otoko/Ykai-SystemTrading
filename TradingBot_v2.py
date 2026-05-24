@@ -48,8 +48,14 @@ ATR_MIN_PCT         = 0.0012     # ATR mínimo 0.12% del precio — descarta mer
 TP1_RATIO           = 1.0        # ratio TP1 (1:1) — cierra TP1_CIERRE_PCT del trade
 TP2_RATIO           = 3.0        # ratio TP2 (3:1) — cierra el resto o trailing stop
 TP1_CIERRE_PCT      = 0.20       # 20% en TP1, 80% sigue al TP2 3:1 — maximiza ganancia por trade
-TRAIL_FACTOR        = 0.4        # trailing: SL a 0.4× distancia TP1 del mejor precio
+TRAIL_FACTOR        = 0.4        # trailing legacy (fallback si pos no tiene ATR)
+TRAIL_MULT          = 1.5        # trailing dinámico: SL a 1.5× ATR desde mejor precio (doc: 2.0-3.0)
 SCORE_MINIMO        = 5          # 5/6 condiciones — solo setups de alta convicción
+
+FAT_FINGER_MAX_PCT  = 0.005      # 0.5% — bloquea si precio señal vs actual difiere más de esto
+FLASH_CRASH_PCT     = 0.030      # 3% en 1 vela 15m de BTC = pánico de mercado → pausa entradas
+FLASH_CRASH_PAUSA_MIN = 30       # minutos de pausa tras flash crash
+MAX_DRAWDOWN_PCT    = 0.15       # 15% desde capital pico → circuit breaker total
 
 TF_TENDENCIA        = "1h"
 TF_MACRO            = "4h"       # filtro macro — 4h y 1h deben coincidir en dirección
@@ -171,6 +177,7 @@ class Posicion:
     tamano_usd: float
     tp1_cerrado:  bool  = False
     mejor_precio: float = 0.0   # mejor precio visto tras TP1 (para trailing stop)
+    atr:          float = 0.0   # ATR en entrada — usado por trailing stop dinámico
     timestamp:    datetime = field(default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 @dataclass
@@ -195,6 +202,7 @@ class EstadoBot:
     posiciones:     dict  = field(default_factory=dict)   # simbolo → Posicion
     cooldowns:      dict  = field(default_factory=dict)   # simbolo → datetime fin cooldown
     capital_actual: float = CAPITAL_USD  # capital real acumulado — se actualiza con cada trade
+    capital_pico:   float = CAPITAL_USD  # máximo capital histórico — base para calcular drawdown
 
 ESTADO_ARCHIVO       = "estado_bot.json"
 
@@ -214,6 +222,9 @@ _sl_recientes: list = []  # lista de datetime de SLs
 # Control spam log CB
 _ultimo_aviso_cb: datetime = datetime(2000, 1, 1)
 
+# Flash Crash Pauser — entradas bloqueadas hasta este timestamp
+_flash_crash_hasta: datetime = datetime(2000, 1, 1)
+
 # ==============================================================================
 # PERSISTENCIA DE ESTADO
 # ==============================================================================
@@ -227,6 +238,7 @@ def guardar_estado(est: "EstadoBot") -> None:
             "trades_dia":     est.trades_dia,
             "bloqueado":      est.bloqueado,
             "capital_actual": est.capital_actual,
+            "capital_pico":   est.capital_pico,
             "posiciones": {
                 sym: {
                     "simbolo":       p.simbolo,
@@ -239,6 +251,7 @@ def guardar_estado(est: "EstadoBot") -> None:
                     "tamano_usd":    p.tamano_usd,
                     "tp1_cerrado":   p.tp1_cerrado,
                     "mejor_precio":  p.mejor_precio,
+                    "atr":           p.atr,
                     "timestamp":     p.timestamp.isoformat(),
                 }
                 for sym, p in est.posiciones.items()
@@ -266,8 +279,9 @@ def cargar_estado() -> "EstadoBot":
         # Si el archivo es de otro día, empezar contadores limpios pero conservar posiciones
         est = EstadoBot()
         est.fecha = hoy
-        # capital_actual se carga siempre — representa el capital real acumulado
+        # capital_actual y capital_pico se cargan siempre (sobreviven al cambio de día)
         est.capital_actual = data.get("capital_actual", CAPITAL_USD)
+        est.capital_pico   = data.get("capital_pico",   est.capital_actual)
 
         if fecha_guardada == hoy:
             est.perdida_dia  = data.get("perdida_dia", 0.0)
@@ -287,6 +301,7 @@ def cargar_estado() -> "EstadoBot":
                 tamano_usd     = pd_["tamano_usd"],
                 tp1_cerrado    = pd_["tp1_cerrado"],
                 mejor_precio   = pd_.get("mejor_precio", 0.0),
+                atr            = pd_.get("atr", 0.0),
                 timestamp      = datetime.fromisoformat(pd_["timestamp"]),
             )
 
@@ -361,6 +376,53 @@ def _guardar_historial_dia() -> None:
     except Exception as e:
         log.warning("No se pudo guardar historial: %s", e)
 
+def calcular_kelly_empirico() -> float:
+    """Kelly Criterion empírico basado en el historial diario de P&L.
+    f* = WR - (1-WR)/RR  donde WR=win rate y RR=ganancia_media/perdida_media.
+    Requiere mínimo 5 días de historial para ser estadísticamente relevante."""
+    historial_archivo = "historial_pnl.json"
+    if not os.path.exists(historial_archivo):
+        return RIESGO_PCT
+    try:
+        with open(historial_archivo) as f:
+            historial = json.load(f)
+        if len(historial) < 5:
+            return RIESGO_PCT   # dataset insuficiente — mantener 2% conservador
+        dias_gan = sum(1 for d in historial if d["neto"] > 0)
+        wr       = dias_gan / len(historial)
+        ganancias = [d["ganancia"] for d in historial if d["ganancia"] > 0]
+        perdidas  = [d["perdida"]  for d in historial if d["perdida"]  > 0]
+        if not ganancias or not perdidas:
+            return RIESGO_PCT
+        rr    = (sum(ganancias)/len(ganancias)) / (sum(perdidas)/len(perdidas))
+        kelly = wr - (1 - wr) / rr
+        # Usar Quarter-Kelly (más conservador) — práctica institucional estándar
+        return round(max(0.005, min(kelly * 0.25, 0.10)), 4)
+    except Exception:
+        return RIESGO_PCT
+
+def _actualizar_flash_crash() -> None:
+    """Detecta pánico en BTC (>3% en 1 vela 15m) y activa pausa de entradas."""
+    global _flash_crash_hasta
+    from datetime import timedelta
+    ahora = datetime.now(timezone.utc).replace(tzinfo=None)
+    if ahora < _flash_crash_hasta:
+        return  # ya estamos en pausa — no re-verificar hasta que expire
+    try:
+        df   = obtener_velas("BTC/USDT", TF_ENTRADA, 3)
+        curr = df.iloc[-1]
+        prev = df.iloc[-2]
+        cambio_pct = abs(float(curr["close"]) - float(prev["close"])) / float(prev["close"])
+        if cambio_pct >= FLASH_CRASH_PCT:
+            _flash_crash_hasta = ahora + timedelta(minutes=FLASH_CRASH_PAUSA_MIN)
+            direccion = "🚀 PUMP" if float(curr["close"]) > float(prev["close"]) else "💥 DUMP"
+            msg = (f"⚡ Flash Crash BTC — {direccion} {cambio_pct*100:.1f}% en 15m\n"
+                   f"Entradas pausadas {FLASH_CRASH_PAUSA_MIN}min hasta {_flash_crash_hasta.strftime('%H:%M UTC')}")
+            log.warning(msg)
+            enviar_telegram(msg)
+    except Exception as e:
+        log.debug("Error verificando flash crash BTC: %s", e)
+
 def verificar_riesgo() -> bool:
     global _ultimo_aviso_cb
     resetear_si_nuevo_dia()
@@ -381,8 +443,28 @@ def verificar_riesgo() -> bool:
         _ultimo_aviso_cb = datetime.now(timezone.utc).replace(tzinfo=None)
         return False
 
+    # Max Drawdown: si el capital cayó >15% desde su pico histórico → CB total
+    if estado.capital_pico > 0:
+        drawdown = (estado.capital_pico - estado.capital_actual) / estado.capital_pico
+        if drawdown >= MAX_DRAWDOWN_PCT:
+            estado.bloqueado = True
+            msg = (f"⛔ MAX DRAWDOWN — capital ${estado.capital_actual:.2f} cayó "
+                   f"{drawdown*100:.1f}% desde pico ${estado.capital_pico:.2f}. "
+                   f"Bot pausado para proteger el capital restante.")
+            log.warning(msg)
+            enviar_telegram(msg)
+            _ultimo_aviso_cb = datetime.now(timezone.utc).replace(tzinfo=None)
+            return False
+
     if len(estado.posiciones) >= MAX_TRADES_ABIERTOS:
         return False  # silencioso
+
+    # Flash Crash Pauser: pausar nuevas entradas si BTC tuvo un movimiento brusco
+    ahora_check = datetime.now(timezone.utc).replace(tzinfo=None)
+    if ahora_check < _flash_crash_hasta:
+        log.debug("Flash Crash Pauser activo — nuevas entradas bloqueadas hasta %s",
+                  _flash_crash_hasta.strftime("%H:%M UTC"))
+        return False
 
     # Pausa global: si hay ≥ SL_GLOBALES_MAX SLs en los últimos SL_GLOBALES_VENTANA min
     if _pausa_global_activa():
@@ -653,6 +735,19 @@ def abrir_posicion(senal: Senal) -> None:
     if not _puede_abrir_por_correlacion(senal.simbolo, senal.direccion):
         return
 
+    # Fat Finger Constraint: verificar que el precio no se movió >0.5% desde la señal
+    # Evita fills en precios malos por delay entre señal y ejecución
+    try:
+        precio_ahora  = precio_actual(senal.simbolo)
+        desvio_pct    = abs(precio_ahora - senal.precio) / senal.precio
+        if desvio_pct > FAT_FINGER_MAX_PCT:
+            log.warning("🫰 Fat Finger bloqueado %s — señal %.4f vs actual %.4f (%.2f%% > %.1f%% máx)",
+                        senal.simbolo, senal.precio, precio_ahora,
+                        desvio_pct * 100, FAT_FINGER_MAX_PCT * 100)
+            return
+    except Exception as e:
+        log.debug("Error Fat Finger check %s: %s — continuando", senal.simbolo, e)
+
     # Tamaño exacto que hace PnL(SL) = riesgo_actual (compounding)
     # tamano = riesgo / distancia_sl_pct  →  SL hit = distancia_sl_pct × tamano = riesgo_actual
     riesgo_usd       = calcular_riesgo_actual()
@@ -702,6 +797,7 @@ def abrir_posicion(senal: Senal) -> None:
         precio_tp2     = senal.tp2,
         leverage       = senal.leverage,
         tamano_usd     = tamano_usd,
+        atr            = senal.atr,   # guardado para trailing dinámico
     )
     estado.posiciones[senal.simbolo] = posicion
     estado.trades_dia += 1
@@ -720,9 +816,13 @@ def precio_actual(simbolo: str) -> float:
     return float(ticker["last"])
 
 def actualizar_trailing(pos: Posicion, precio: float) -> None:
-    """Tras TP1: rastrea el mejor precio y ajusta el SL para asegurar ganancia."""
-    distancia_tp1 = abs(pos.precio_entrada - pos.precio_tp1)
-    margen_trail  = distancia_tp1 * TRAIL_FACTOR
+    """Tras TP1: trailing stop dinámico basado en ATR (doc: Trailing_Stop = SIC ± Mult×ATR).
+    Si la posición tiene ATR guardado, usa 1.5×ATR. Si no, fallback a distancia_tp1×TRAIL_FACTOR."""
+    if pos.atr > 0:
+        margen_trail = pos.atr * TRAIL_MULT   # dinámico — se adapta a la volatilidad real
+    else:
+        distancia_tp1 = abs(pos.precio_entrada - pos.precio_tp1)
+        margen_trail  = distancia_tp1 * TRAIL_FACTOR  # fallback legacy
 
     if pos.direccion == "SHORT":
         # mejor precio = precio más bajo visto
@@ -799,10 +899,12 @@ def cerrar_parcial(pos: Posicion, precio_scan: float, motivo: str) -> None:
             return
 
     estado.ganancia_dia    += ganancia
-    estado.capital_actual  += ganancia   # compounding: el capital crece con cada TP1
+    estado.capital_actual  += ganancia
+    if estado.capital_actual > estado.capital_pico:   # actualizar pico histórico
+        estado.capital_pico = estado.capital_actual
     guardar_estado(estado)
     msg = (f"✅ {motivo} parcial {pos.simbolo} @ {precio_calc:.4f} | +${ganancia:.2f} | SL → breakeven"
-           f" | Capital: ${estado.capital_actual:.2f}")
+           f" | Capital: ${estado.capital_actual:.2f} (pico: ${estado.capital_pico:.2f})")
     log.info(msg)
     enviar_telegram(msg)
 
@@ -840,7 +942,9 @@ def cerrar_posicion(pos: Posicion, precio_scan: float, motivo: str) -> None:
 
     if pnl >= 0:
         estado.ganancia_dia   += pnl
-        estado.capital_actual += pnl   # compounding: capital crece con ganancias
+        estado.capital_actual += pnl
+        if estado.capital_actual > estado.capital_pico:  # nuevo pico histórico
+            estado.capital_pico = estado.capital_actual
     else:
         estado.perdida_dia    += abs(pnl)
         estado.capital_actual  = max(estado.capital_actual - abs(pnl), RIESGO_MIN_USD * 5)
@@ -848,9 +952,12 @@ def cerrar_posicion(pos: Posicion, precio_scan: float, motivo: str) -> None:
             activar_cooldown(pos.simbolo)
             _registrar_sl_global()  # detectar rachas de pérdidas para pausa global
 
-    emoji = "✅" if motivo != "SL" else "❌"
-    msg   = (f"{emoji} {motivo} {pos.simbolo} @ {precio_calc:.4f} | PnL ${pnl:+.2f}"
-             f" | Capital: ${estado.capital_actual:.2f} | Día: +${estado.ganancia_dia:.2f} / -${estado.perdida_dia:.2f}")
+    emoji    = "✅" if motivo != "SL" else "❌"
+    drawdown = (estado.capital_pico - estado.capital_actual) / estado.capital_pico if estado.capital_pico > 0 else 0
+    dd_str   = f" | DD: {drawdown*100:.1f}%" if drawdown > 0.01 else ""
+    msg      = (f"{emoji} {motivo} {pos.simbolo} @ {precio_calc:.4f} | PnL ${pnl:+.2f}"
+                f" | Capital: ${estado.capital_actual:.2f}{dd_str}"
+                f" | Día: +${estado.ganancia_dia:.2f} / -${estado.perdida_dia:.2f}")
     log.info(msg)
     enviar_telegram(msg)
 
@@ -905,6 +1012,9 @@ def ciclo() -> None:
     if not verificar_riesgo():
         return
 
+    # Verificar flash crash en BTC antes de escanear señales (evita entrar en pánico)
+    _actualizar_flash_crash()
+
     for simbolo in ACTIVOS:
         if simbolo_ya_abierto(simbolo):
             continue
@@ -920,9 +1030,15 @@ def main() -> None:
     estado = cargar_estado()
     modo = "DRY-RUN (simulación)" if DRY_RUN else "⚠️  REAL EN TESTNET"
     log.info("=" * 60)
-    log.info("YKAI TradingBot v2.7 iniciado — modo: %s", modo)
-    log.info("Capital actual: $%.2f | Riesgo/trade: $%.2f (%.0f%%) | CB: $%.2f",
-             estado.capital_actual, calcular_riesgo_actual(), RIESGO_PCT * 100, MAX_PERDIDA_DIA)
+    log.info("YKAI TradingBot v2.8 iniciado — modo: %s", modo)
+    log.info("Capital actual: $%.2f | Pico: $%.2f | Riesgo/trade: $%.2f (%.0f%%) | CB diario: $%.2f | Max DD: %.0f%%",
+             estado.capital_actual, estado.capital_pico, calcular_riesgo_actual(),
+             RIESGO_PCT * 100, MAX_PERDIDA_DIA, MAX_DRAWDOWN_PCT * 100)
+    kelly = calcular_kelly_empirico()
+    if kelly != RIESGO_PCT:
+        log.info("Kelly Criterion empírico: %.2f%% | Actual: %.2f%% — %s",
+                 kelly * 100, RIESGO_PCT * 100,
+                 "✅ alineado" if abs(kelly - RIESGO_PCT) < 0.005 else "⚠️ diferencia — revisar historial")
     log.info("Activos (%d): %s", len(ACTIVOS), ", ".join(ACTIVOS))
     log.info("Max posiciones: %d | Score mínimo: %d/6 | Trail factor: %.1f",
              MAX_TRADES_ABIERTOS, SCORE_MINIMO, TRAIL_FACTOR)
