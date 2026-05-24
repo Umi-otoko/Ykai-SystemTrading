@@ -25,10 +25,12 @@ load_dotenv()
 
 DRY_RUN             = True       # ← cambiar a False para órdenes reales en testnet
 
-CAPITAL_USD         = 50.0
-RIESGO_USD          = 1.0        # $1 por trade = 2% del capital
-MAX_PERDIDA_DIA     = 10.0        # $3 = CB — con score 5/6 y filtro 4h, 3 SLs = señal de mercado adverso
-MAX_TRADES_ABIERTOS = 2          # máximo 2 posiciones: reduce riesgo correlacionado
+CAPITAL_USD         = 50.0       # capital inicial de referencia
+RIESGO_PCT          = 0.02       # 2% del capital actual por trade — COMPOUNDING automático
+RIESGO_MIN_USD      = 0.50       # piso: nunca arriesgar menos de $0.50
+RIESGO_MAX_USD      = 5.00       # techo: máximo $5.00/trade (limita exposición hasta $250 capital)
+MAX_PERDIDA_DIA     = 4.4        # CB — con score 5/6 y filtro 4h, 3 SLs = mercado adverso
+MAX_TRADES_ABIERTOS = 3          # 3 posiciones — más oportunidades con anti-correlación Tier S
 
 LEVERAGE_MIN        = 1          # 1x mínimo — respeta el $1 de riesgo en pares volátiles
 LEVERAGE_MAX        = 15         # 15x máximo — captura el leverage óptimo en pares de bajo ATR%
@@ -45,7 +47,7 @@ ATR_MIN_PCT         = 0.0012     # ATR mínimo 0.12% del precio — descarta mer
 
 TP1_RATIO           = 1.0        # ratio TP1 (1:1) — cierra TP1_CIERRE_PCT del trade
 TP2_RATIO           = 3.0        # ratio TP2 (3:1) — cierra el resto o trailing stop
-TP1_CIERRE_PCT      = 0.25       # 25% en TP1, 75% sigue con trailing
+TP1_CIERRE_PCT      = 0.20       # 20% en TP1, 80% sigue al TP2 3:1 — maximiza ganancia por trade
 TRAIL_FACTOR        = 0.4        # trailing: SL a 0.4× distancia TP1 del mejor precio
 SCORE_MINIMO        = 5          # 5/6 condiciones — solo setups de alta convicción
 
@@ -59,8 +61,10 @@ SL_GLOBALES_VENTANA = 30         # minutos — ventana para detectar múltiples 
 SL_GLOBALES_MAX     = 2          # si ≥2 SLs en la ventana → pausa global de nueva entrada
 COOLDOWN_SL_SEGUNDOS = 7200      # 2h sin re-entrar al mismo símbolo tras SL (antes 1h)
 
-# Tier S: BTC, ETH, SOL | Tier A: XRP, DOGE, BNB
-ACTIVOS             = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "BNB/USDT"]
+# Tier S: alta correlación entre sí — máx 1 en la misma dirección simultáneamente
+# Tier A: menor correlación con Tier S — pueden coexistir con cualquier Tier S
+TIER_S  = {"BTC/USDT", "ETH/USDT", "SOL/USDT"}
+ACTIVOS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "BNB/USDT"]
 
 # ==============================================================================
 # LOGGING
@@ -183,15 +187,23 @@ class Senal:
 
 @dataclass
 class EstadoBot:
-    perdida_dia:  float = 0.0
-    ganancia_dia: float = 0.0
-    trades_dia:   int   = 0
-    bloqueado:    bool  = False
-    fecha:        date  = field(default_factory=date.today)
-    posiciones:   dict  = field(default_factory=dict)   # simbolo → Posicion
-    cooldowns:    dict  = field(default_factory=dict)   # simbolo → datetime fin cooldown
+    perdida_dia:    float = 0.0
+    ganancia_dia:   float = 0.0
+    trades_dia:     int   = 0
+    bloqueado:      bool  = False
+    fecha:          date  = field(default_factory=date.today)
+    posiciones:     dict  = field(default_factory=dict)   # simbolo → Posicion
+    cooldowns:      dict  = field(default_factory=dict)   # simbolo → datetime fin cooldown
+    capital_actual: float = CAPITAL_USD  # capital real acumulado — se actualiza con cada trade
 
 ESTADO_ARCHIVO       = "estado_bot.json"
+
+def calcular_riesgo_actual() -> float:
+    """Retorna el riesgo en USD para el próximo trade según el capital actual.
+    Usa RIESGO_PCT (2%) del capital real acumulado, con piso y techo.
+    Ejemplo: $50 capital → $1.00 riesgo | $100 capital → $2.00 riesgo."""
+    riesgo = estado.capital_actual * RIESGO_PCT
+    return round(max(RIESGO_MIN_USD, min(riesgo, RIESGO_MAX_USD)), 2)
 
 # Caché de tendencia 4h (no llamar a la API en cada ciclo de 20s)
 _cache_macro: dict = {}   # simbolo → (datetime, "ALCISTA"|"BAJISTA"|"NEUTRAL")
@@ -209,11 +221,12 @@ _ultimo_aviso_cb: datetime = datetime(2000, 1, 1)
 def guardar_estado(est: "EstadoBot") -> None:
     try:
         data = {
-            "fecha":        est.fecha.isoformat(),
-            "perdida_dia":  est.perdida_dia,
-            "ganancia_dia": est.ganancia_dia,
-            "trades_dia":   est.trades_dia,
-            "bloqueado":    est.bloqueado,
+            "fecha":          est.fecha.isoformat(),
+            "perdida_dia":    est.perdida_dia,
+            "ganancia_dia":   est.ganancia_dia,
+            "trades_dia":     est.trades_dia,
+            "bloqueado":      est.bloqueado,
+            "capital_actual": est.capital_actual,
             "posiciones": {
                 sym: {
                     "simbolo":       p.simbolo,
@@ -253,6 +266,9 @@ def cargar_estado() -> "EstadoBot":
         # Si el archivo es de otro día, empezar contadores limpios pero conservar posiciones
         est = EstadoBot()
         est.fecha = hoy
+        # capital_actual se carga siempre — representa el capital real acumulado
+        est.capital_actual = data.get("capital_actual", CAPITAL_USD)
+
         if fecha_guardada == hoy:
             est.perdida_dia  = data.get("perdida_dia", 0.0)
             est.ganancia_dia = data.get("ganancia_dia", 0.0)
@@ -497,10 +513,12 @@ def obtener_tendencia_macro(simbolo: str) -> str:
 # ==============================================================================
 
 def calcular_leverage_optimo(precio_entrada: float, precio_sl: float) -> int:
+    """Leverage que hace PnL(SL) = riesgo_actual exactamente."""
     distancia_pct = abs(precio_entrada - precio_sl) / precio_entrada
     if distancia_pct == 0:
         return LEVERAGE_MIN
-    leverage = RIESGO_USD / (CAPITAL_USD * distancia_pct)
+    riesgo = calcular_riesgo_actual()
+    leverage = riesgo / (estado.capital_actual * distancia_pct)
     return int(np.clip(leverage, LEVERAGE_MIN, LEVERAGE_MAX))
 
 # ==============================================================================
@@ -611,19 +629,37 @@ def _set_leverage(simbolo: str, leverage: int) -> None:
 def _crear_orden_market(simbolo: str, lado: str, cantidad: float) -> dict:
     return exchange.create_order(simbolo, "market", lado, cantidad)
 
+def _puede_abrir_por_correlacion(simbolo: str, direccion: str) -> bool:
+    """Anti-correlación Tier S: máximo 1 trade de BTC/ETH/SOL en la misma dirección.
+    Evita el desastre de 3 Tier S correlacionados que se van al SL juntos."""
+    if simbolo not in TIER_S:
+        return True  # Tier A: sin restricción de correlación
+    tier_s_activos = sum(
+        1 for sym, pos in estado.posiciones.items()
+        if sym in TIER_S and pos.direccion == direccion
+    )
+    if tier_s_activos >= 1:
+        log.debug("Anti-correlación: ya hay %d Tier S en %s — %s descartado",
+                  tier_s_activos, direccion, simbolo)
+        return False
+    return True
+
 def abrir_posicion(senal: Senal) -> None:
     if simbolo_ya_abierto(senal.simbolo):
         return
     if en_cooldown(senal.simbolo):
         log.info("Cooldown activo en %s — señal ignorada", senal.simbolo)
         return
+    if not _puede_abrir_por_correlacion(senal.simbolo, senal.direccion):
+        return
 
-    # Tamaño exacto que hace PnL(SL) = RIESGO_USD
-    # tamano = riesgo / distancia_sl_pct  →  SL hit = distancia_sl_pct × tamano = $1
+    # Tamaño exacto que hace PnL(SL) = riesgo_actual (compounding)
+    # tamano = riesgo / distancia_sl_pct  →  SL hit = distancia_sl_pct × tamano = riesgo_actual
+    riesgo_usd       = calcular_riesgo_actual()
     distancia_sl_pct = abs(senal.precio - senal.sl) / senal.precio
-    tamano_usd       = RIESGO_USD / distancia_sl_pct if distancia_sl_pct > 0 else 0.0
-    # No exceder el capital disponible apalancado
-    tamano_usd       = min(tamano_usd, CAPITAL_USD * senal.leverage)
+    tamano_usd       = riesgo_usd / distancia_sl_pct if distancia_sl_pct > 0 else 0.0
+    # No exceder el capital real disponible apalancado
+    tamano_usd       = min(tamano_usd, estado.capital_actual * senal.leverage)
 
     if tamano_usd < TAMANO_MINIMO_USD:
         log.debug("Posición demasiado pequeña en %s (%.2f USD) — señal ignorada", senal.simbolo, tamano_usd)
@@ -633,15 +669,16 @@ def abrir_posicion(senal: Senal) -> None:
     lado     = "buy" if senal.direccion == "LONG" else "sell"
 
     if DRY_RUN:
-        log.info("[DRY-RUN] ABRIR %s %s | qty=%.4f | precio=%.4f | lev=%dx | SL=%.4f | TP1=%.4f | TP2=%.4f",
+        log.info("[DRY-RUN] ABRIR %s %s | qty=%.4f | precio=%.4f | lev=%dx | SL=%.4f | TP1=%.4f | TP2=%.4f | riesgo=$%.2f",
                  senal.direccion, senal.simbolo, cantidad, senal.precio, senal.leverage,
-                 senal.sl, senal.tp1, senal.tp2)
+                 senal.sl, senal.tp1, senal.tp2, riesgo_usd)
         ganancia_tp1   = tamano_usd * abs(senal.tp1 - senal.precio) / senal.precio * TP1_CIERRE_PCT
         ganancia_tp2   = tamano_usd * abs(senal.tp2 - senal.precio) / senal.precio * (1 - TP1_CIERRE_PCT)
         msg = (
             f"📊 [DRY-RUN] {senal.direccion} {senal.simbolo}\n"
             f"Precio: {senal.precio:.4f} | Lev: {senal.leverage}x | Score: {senal.score}/6\n"
-            f"SL:  {senal.sl:.4f}  → máx -$1.00\n"
+            f"Capital: ${estado.capital_actual:.2f} | Riesgo: ${riesgo_usd:.2f} ({RIESGO_PCT*100:.0f}%)\n"
+            f"SL:  {senal.sl:.4f}  → máx -${riesgo_usd:.2f}\n"
             f"TP1 ({int(TP1_CIERRE_PCT*100)}%): {senal.tp1:.4f} → +${ganancia_tp1:.2f}\n"
             f"TP2 ({int((1-TP1_CIERRE_PCT)*100)}%): {senal.tp2:.4f} → +${ganancia_tp2:.2f}\n"
             f"Posición: ${tamano_usd:.0f} | Ganancia completa esperada: +${ganancia_tp1+ganancia_tp2:.2f}"
@@ -761,9 +798,11 @@ def cerrar_parcial(pos: Posicion, precio_scan: float, motivo: str) -> None:
             log.error("Error cierre parcial %s: %s", pos.simbolo, e)
             return
 
-    estado.ganancia_dia += ganancia
+    estado.ganancia_dia    += ganancia
+    estado.capital_actual  += ganancia   # compounding: el capital crece con cada TP1
     guardar_estado(estado)
-    msg = f"✅ {motivo} parcial {pos.simbolo} @ {precio_calc:.4f} | +${ganancia:.2f} | SL → breakeven"
+    msg = (f"✅ {motivo} parcial {pos.simbolo} @ {precio_calc:.4f} | +${ganancia:.2f} | SL → breakeven"
+           f" | Capital: ${estado.capital_actual:.2f}")
     log.info(msg)
     enviar_telegram(msg)
 
@@ -800,15 +839,18 @@ def cerrar_posicion(pos: Posicion, precio_scan: float, motivo: str) -> None:
             return
 
     if pnl >= 0:
-        estado.ganancia_dia += pnl
+        estado.ganancia_dia   += pnl
+        estado.capital_actual += pnl   # compounding: capital crece con ganancias
     else:
-        estado.perdida_dia  += abs(pnl)
+        estado.perdida_dia    += abs(pnl)
+        estado.capital_actual  = max(estado.capital_actual - abs(pnl), RIESGO_MIN_USD * 5)
         if motivo == "SL":
             activar_cooldown(pos.simbolo)
             _registrar_sl_global()  # detectar rachas de pérdidas para pausa global
 
     emoji = "✅" if motivo != "SL" else "❌"
-    msg   = f"{emoji} {motivo} {pos.simbolo} @ {precio_calc:.4f} | PnL ${pnl:+.2f} | Día: +${estado.ganancia_dia:.2f} / -${estado.perdida_dia:.2f}"
+    msg   = (f"{emoji} {motivo} {pos.simbolo} @ {precio_calc:.4f} | PnL ${pnl:+.2f}"
+             f" | Capital: ${estado.capital_actual:.2f} | Día: +${estado.ganancia_dia:.2f} / -${estado.perdida_dia:.2f}")
     log.info(msg)
     enviar_telegram(msg)
 
@@ -825,8 +867,10 @@ def enviar_resumen_si_corresponde() -> None:
     global _ultimo_resumen
     ahora = datetime.now(timezone.utc)
     if (ahora - _ultimo_resumen).seconds >= 3600:  # cada hora
+        riesgo_vigente = calcular_riesgo_actual()
         msg = (
             f"📈 Resumen YKAI — {ahora.strftime('%H:%M UTC')}\n"
+            f"💰 Capital: ${estado.capital_actual:.2f} | Riesgo/trade: ${riesgo_vigente:.2f}\n"
             f"Trades hoy: {estado.trades_dia}\n"
             f"Ganancia: +${estado.ganancia_dia:.2f} | Pérdida: -${estado.perdida_dia:.2f}\n"
             f"Posiciones abiertas: {len(estado.posiciones)}\n"
@@ -876,8 +920,9 @@ def main() -> None:
     estado = cargar_estado()
     modo = "DRY-RUN (simulación)" if DRY_RUN else "⚠️  REAL EN TESTNET"
     log.info("=" * 60)
-    log.info("YKAI TradingBot v2.6 iniciado — modo: %s", modo)
-    log.info("Capital: $%.2f | Riesgo/trade: $%.2f | CB: $%.2f", CAPITAL_USD, RIESGO_USD, MAX_PERDIDA_DIA)
+    log.info("YKAI TradingBot v2.7 iniciado — modo: %s", modo)
+    log.info("Capital actual: $%.2f | Riesgo/trade: $%.2f (%.0f%%) | CB: $%.2f",
+             estado.capital_actual, calcular_riesgo_actual(), RIESGO_PCT * 100, MAX_PERDIDA_DIA)
     log.info("Activos (%d): %s", len(ACTIVOS), ", ".join(ACTIVOS))
     log.info("Max posiciones: %d | Score mínimo: %d/6 | Trail factor: %.1f",
              MAX_TRADES_ABIERTOS, SCORE_MINIMO, TRAIL_FACTOR)
@@ -887,7 +932,8 @@ def main() -> None:
     enviar_telegram(
         f"🤖 YKAI Bot iniciado [{modo}]\n"
         f"Activos ({len(ACTIVOS)}): {', '.join(a.split('/')[0] for a in ACTIVOS)}\n"
-        f"Max trades: {MAX_TRADES_ABIERTOS} | Riesgo/trade: $1.00 | CB: ${MAX_PERDIDA_DIA:.2f}"
+        f"💰 Capital: ${estado.capital_actual:.2f} | Riesgo: ${calcular_riesgo_actual():.2f} ({RIESGO_PCT*100:.0f}%)\n"
+        f"Max trades: {MAX_TRADES_ABIERTOS} (anti-correlación Tier S) | CB: ${MAX_PERDIDA_DIA:.2f}"
     )
 
     while True:

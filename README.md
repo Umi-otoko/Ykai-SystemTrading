@@ -146,6 +146,7 @@ Precio bajo EMA200, cruce bajista EMA20/50, RSI 35–60, volumen, tendencia 1h B
 | v2.4 | Activos Tier A (XRP, DOGE, BNB), leverage 1-15x, trail 0.4, TP1 25%, scan 20s, tamaño exacto $1 riesgo |
 | v2.5 | Filtro macro 4h (c6/d6 dual), score mínimo 5/6, MAX_TRADES=2, pausa global 2 SLs/30min, cooldown 2h |
 | v2.6 | Precisión: ATR mínimo 0.12%, volumen 1.5x, RSI SHORT 38-55, LONG 42-60, EMA gap 0.02%, vela confirmada, cap estado |
+| v2.7 | Compounding 2%: riesgo dinámico $1→$2→... con capital; MAX_TRADES=3 anti-correlación Tier S; TP1 20%; objetivo 2x en 2 meses |
 
 ---
 
