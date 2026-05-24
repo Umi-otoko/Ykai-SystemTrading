@@ -53,9 +53,17 @@ TRAIL_MULT          = 1.5        # trailing dinámico: SL a 1.5× ATR desde mejo
 SCORE_MINIMO        = 5          # 5/6 condiciones — solo setups de alta convicción
 
 FAT_FINGER_MAX_PCT  = 0.005      # 0.5% — bloquea si precio señal vs actual difiere más de esto
-FLASH_CRASH_PCT     = 0.030      # 3% en 1 vela 15m de BTC = pánico de mercado → pausa entradas
+FLASH_CRASH_PCT     = 0.030      # 3% en 1 vela 15m de BTC = pánico → pausa entradas
 FLASH_CRASH_PAUSA_MIN = 30       # minutos de pausa tras flash crash
 MAX_DRAWDOWN_PCT    = 0.15       # 15% desde capital pico → circuit breaker total
+
+# BTC Momentum Filter (Holly AI concept: bloquear señales cuando el mercado líder se mueve en contra)
+# Si BTC subió >1.5% en la última vela 1h → bloquear SHORTs en todos los activos
+# Si BTC bajó >1.5% en la última vela 1h → bloquear LONGs en todos los activos
+BTC_MOMENTUM_PCT    = 0.015      # 1.5% en 1h — movimiento fuerte de BTC que arrastra a los alts
+CACHE_BTC_MOM_SECS  = 60         # refrescar momentum BTC cada 60s
+
+RR_MINIMO           = 1.8        # ratio R:R mínimo TP2/SL — rechaza trades con potencial insuficiente
 
 TF_TENDENCIA        = "1h"
 TF_MACRO            = "4h"       # filtro macro — 4h y 1h deben coincidir en dirección
@@ -225,6 +233,9 @@ _ultimo_aviso_cb: datetime = datetime(2000, 1, 1)
 # Flash Crash Pauser — entradas bloqueadas hasta este timestamp
 _flash_crash_hasta: datetime = datetime(2000, 1, 1)
 
+# Caché de momentum BTC 1h (cuánto se movió BTC en la última vela de 1h)
+_cache_btc_mom: dict = {}   # "btc_1h" → (datetime, float % cambio)
+
 # ==============================================================================
 # PERSISTENCIA DE ESTADO
 # ==============================================================================
@@ -349,11 +360,13 @@ def resetear_si_nuevo_dia() -> None:
 def _guardar_historial_dia() -> None:
     historial_archivo = "historial_pnl.json"
     registro = {
-        "fecha":        estado.fecha.isoformat(),
-        "ganancia":     round(estado.ganancia_dia, 2),
-        "perdida":      round(estado.perdida_dia, 2),
-        "neto":         round(estado.ganancia_dia - estado.perdida_dia, 2),
-        "trades":       estado.trades_dia,
+        "fecha":           estado.fecha.isoformat(),
+        "ganancia":        round(estado.ganancia_dia, 2),
+        "perdida":         round(estado.perdida_dia, 2),
+        "neto":            round(estado.ganancia_dia - estado.perdida_dia, 2),
+        "trades":          estado.trades_dia,
+        "capital_cierre":  round(estado.capital_actual, 2),  # capital al cierre del día
+        "capital_pico":    round(estado.capital_pico, 2),    # máximo alcanzado ese día
     }
     try:
         historial = []
@@ -400,6 +413,62 @@ def calcular_kelly_empirico() -> float:
         return round(max(0.005, min(kelly * 0.25, 0.10)), 4)
     except Exception:
         return RIESGO_PCT
+
+def obtener_momentum_btc_1h() -> float:
+    """% de cambio de BTC en la última vela cerrada de 1h (cacheado 60s).
+    Positivo = BTC subiendo | Negativo = BTC bajando.
+    Concepto Holly AI: bloquear señales cuando el mercado líder se mueve en contra."""
+    from datetime import timedelta
+    ahora = datetime.now(timezone.utc).replace(tzinfo=None)
+    cached = _cache_btc_mom.get("btc_1h")
+    if cached:
+        ts, valor = cached
+        if (ahora - ts).total_seconds() < CACHE_BTC_MOM_SECS:
+            return valor
+    try:
+        df     = obtener_velas("BTC/USDT", TF_TENDENCIA, 3)
+        curr   = df.iloc[-1]
+        prev   = df.iloc[-2]
+        cambio = (float(curr["close"]) - float(prev["close"])) / float(prev["close"])
+    except Exception:
+        cambio = 0.0
+    _cache_btc_mom["btc_1h"] = (ahora, cambio)
+    return cambio
+
+def calcular_metricas_historial() -> dict:
+    """Sharpe, Sortino y win rate desde el historial diario de P&L.
+    Sharpe = retorno_medio / std × sqrt(365) — mide calidad ajustada al riesgo.
+    Sortino = retorno_medio / std_downside × sqrt(365) — solo penaliza días negativos.
+    Requiere mínimo 5 días de historial."""
+    historial_archivo = "historial_pnl.json"
+    if not os.path.exists(historial_archivo):
+        return {}
+    try:
+        with open(historial_archivo) as f:
+            historial = json.load(f)
+        if len(historial) < 5:
+            return {"dias": len(historial)}
+        cap_ref  = historial[0].get("capital_cierre", CAPITAL_USD) or CAPITAL_USD
+        retornos = np.array([d["neto"] / cap_ref for d in historial])
+        media    = float(np.mean(retornos))
+        std      = float(np.std(retornos))
+        sharpe   = round(media / std * np.sqrt(365), 2) if std > 0 else 0.0
+        downside = retornos[retornos < 0]
+        std_down = float(np.std(downside)) if len(downside) > 0 else std
+        sortino  = round(media / std_down * np.sqrt(365), 2) if std_down > 0 else 0.0
+        wr       = sum(1 for r in retornos if r > 0) / len(retornos)
+        return {
+            "dias":             len(historial),
+            "win_rate":         round(wr, 3),
+            "retorno_dia_pct":  round(media * 100, 3),
+            "sharpe":           sharpe,
+            "sortino":          sortino,
+            "mejor_dia_pct":    round(float(np.max(retornos)) * 100, 2),
+            "peor_dia_pct":     round(float(np.min(retornos)) * 100, 2),
+        }
+    except Exception as e:
+        log.debug("Error métricas historial: %s", e)
+        return {}
 
 def _actualizar_flash_crash() -> None:
     """Detecta pánico en BTC (>3% en 1 vela 15m) y activa pausa de entradas."""
@@ -637,6 +706,16 @@ def evaluar_senal(simbolo: str) -> Senal | None:
     # Tendencia macro (4h) — con caché para no sobrecargar la API
     tendencia_4h = obtener_tendencia_macro(simbolo)
 
+    # BTC Momentum Filter (Holly AI concept) — cacheado 60s
+    # Si BTC se mueve fuerte en 1h, los alts lo siguen → no ir en contra del líder
+    momentum_btc = obtener_momentum_btc_1h() if simbolo != "BTC/USDT" else 0.0
+    btc_pump     = momentum_btc >  BTC_MOMENTUM_PCT   # BTC subiendo fuerte → no SHORTs
+    btc_dump     = momentum_btc < -BTC_MOMENTUM_PCT   # BTC bajando fuerte → no LONGs
+    if btc_pump:
+        log.debug("BTC momentum PUMP +%.2f%% — SHORTs en %s bloqueados", momentum_btc*100, simbolo)
+    if btc_dump:
+        log.debug("BTC momentum DUMP %.2f%% — LONGs en %s bloqueados", momentum_btc*100, simbolo)
+
     # ── LONG ────────────────────────────────────────────────────────────────
     sl_long  = precio - atr * ATR_MULT
     tp1_long = precio + (precio - sl_long) * TP1_RATIO
@@ -659,10 +738,18 @@ def evaluar_senal(simbolo: str) -> Senal | None:
     score_long = sum([c1, c2, c3, c4, c5, c6])
 
     if score_long >= SCORE_MINIMO:
-        lev = calcular_leverage_optimo(precio, sl_long)
-        log.info("SEÑAL LONG %s | score %d/6 | 1h:%s 4h:%s | precio %.4f | SL %.4f | TP1 %.4f | lev %dx",
-                 simbolo, score_long, tendencia_1h, tendencia_4h, precio, sl_long, tp1_long, lev)
-        return Senal(simbolo, "LONG", score_long, precio, sl_long, tp1_long, tp2_long, lev, atr)
+        if btc_dump:
+            log.debug("LONG %s score %d/6 bloqueado — BTC dump %.2f%% en 1h", simbolo, score_long, momentum_btc*100)
+        else:
+            rr_long = (tp2_long - precio) / (precio - sl_long) if (precio - sl_long) > 0 else 0
+            if rr_long < RR_MINIMO:
+                log.debug("R:R insuficiente LONG %s (%.1f:1 < %.1f:1 mínimo) — señal rechazada",
+                          simbolo, rr_long, RR_MINIMO)
+            else:
+                lev = calcular_leverage_optimo(precio, sl_long)
+                log.info("SEÑAL LONG %s | score %d/6 | 1h:%s 4h:%s | BTC mom:%.1f%% | precio %.4f | SL %.4f | TP1 %.4f | R:R %.1f:1 | lev %dx",
+                         simbolo, score_long, tendencia_1h, tendencia_4h, momentum_btc*100, precio, sl_long, tp1_long, rr_long, lev)
+                return Senal(simbolo, "LONG", score_long, precio, sl_long, tp1_long, tp2_long, lev, atr)
     elif score_long == SCORE_MINIMO - 1:
         log.debug("Cerca LONG %s | score %d/6 | 1h:%s 4h:%s | RSI %.1f",
                   simbolo, score_long, tendencia_1h, tendencia_4h, curr["rsi"])
@@ -689,10 +776,18 @@ def evaluar_senal(simbolo: str) -> Senal | None:
     score_short = sum([d1, d2, d3, d4, d5, d6])
 
     if score_short >= SCORE_MINIMO:
-        lev = calcular_leverage_optimo(precio, sl_short)
-        log.info("SEÑAL SHORT %s | score %d/6 | 1h:%s 4h:%s | precio %.4f | SL %.4f | TP1 %.4f | lev %dx",
-                 simbolo, score_short, tendencia_1h, tendencia_4h, precio, sl_short, tp1_short, lev)
-        return Senal(simbolo, "SHORT", score_short, precio, sl_short, tp1_short, tp2_short, lev, atr)
+        if btc_pump:
+            log.debug("SHORT %s score %d/6 bloqueado — BTC pump +%.2f%% en 1h", simbolo, score_short, momentum_btc*100)
+        else:
+            rr_short = (precio - tp2_short) / (sl_short - precio) if (sl_short - precio) > 0 else 0
+            if rr_short < RR_MINIMO:
+                log.debug("R:R insuficiente SHORT %s (%.1f:1 < %.1f:1 mínimo) — señal rechazada",
+                          simbolo, rr_short, RR_MINIMO)
+            else:
+                lev = calcular_leverage_optimo(precio, sl_short)
+                log.info("SEÑAL SHORT %s | score %d/6 | 1h:%s 4h:%s | BTC mom:%.1f%% | precio %.4f | SL %.4f | TP1 %.4f | R:R %.1f:1 | lev %dx",
+                         simbolo, score_short, tendencia_1h, tendencia_4h, momentum_btc*100, precio, sl_short, tp1_short, rr_short, lev)
+                return Senal(simbolo, "SHORT", score_short, precio, sl_short, tp1_short, tp2_short, lev, atr)
     elif score_short == SCORE_MINIMO - 1:
         log.debug("Cerca SHORT %s | score %d/6 | 1h:%s 4h:%s | RSI %.1f",
                   simbolo, score_short, tendencia_1h, tendencia_4h, curr["rsi"])
@@ -1030,15 +1125,23 @@ def main() -> None:
     estado = cargar_estado()
     modo = "DRY-RUN (simulación)" if DRY_RUN else "⚠️  REAL EN TESTNET"
     log.info("=" * 60)
-    log.info("YKAI TradingBot v2.8 iniciado — modo: %s", modo)
+    log.info("YKAI TradingBot v2.9 iniciado — modo: %s", modo)
     log.info("Capital actual: $%.2f | Pico: $%.2f | Riesgo/trade: $%.2f (%.0f%%) | CB diario: $%.2f | Max DD: %.0f%%",
              estado.capital_actual, estado.capital_pico, calcular_riesgo_actual(),
              RIESGO_PCT * 100, MAX_PERDIDA_DIA, MAX_DRAWDOWN_PCT * 100)
     kelly = calcular_kelly_empirico()
     if kelly != RIESGO_PCT:
-        log.info("Kelly Criterion empírico: %.2f%% | Actual: %.2f%% — %s",
+        log.info("Kelly Criterion: %.2f%% (Quarter-Kelly) | Riesgo actual: %.2f%% — %s",
                  kelly * 100, RIESGO_PCT * 100,
-                 "✅ alineado" if abs(kelly - RIESGO_PCT) < 0.005 else "⚠️ diferencia — revisar historial")
+                 "✅ alineado" if abs(kelly - RIESGO_PCT) < 0.005 else "⚠️ diferencia — más datos necesarios")
+    metricas = calcular_metricas_historial()
+    if metricas.get("dias", 0) >= 5:
+        log.info("Métricas historial (%d días) | WR: %.0f%% | Retorno/día: %.2f%% | Sharpe: %.2f | Sortino: %.2f | Mejor: +%.1f%% | Peor: %.1f%%",
+                 metricas["dias"], metricas["win_rate"]*100, metricas["retorno_dia_pct"],
+                 metricas["sharpe"], metricas["sortino"],
+                 metricas["mejor_dia_pct"], metricas["peor_dia_pct"])
+    elif metricas.get("dias", 0) > 0:
+        log.info("Historial: %d día(s) — necesita ≥5 días para calcular Sharpe/Sortino", metricas["dias"])
     log.info("Activos (%d): %s", len(ACTIVOS), ", ".join(ACTIVOS))
     log.info("Max posiciones: %d | Score mínimo: %d/6 | Trail factor: %.1f",
              MAX_TRADES_ABIERTOS, SCORE_MINIMO, TRAIL_FACTOR)

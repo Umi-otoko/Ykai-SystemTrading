@@ -148,6 +148,7 @@ Precio bajo EMA200, cruce bajista EMA20/50, RSI 35–60, volumen, tendencia 1h B
 | v2.6 | Precisión: ATR mínimo 0.12%, volumen 1.5x, RSI SHORT 38-55, LONG 42-60, EMA gap 0.02%, vela confirmada, cap estado |
 | v2.7 | Compounding 2%: riesgo dinámico $1→$2→... con capital; MAX_TRADES=3 anti-correlación Tier S; TP1 20%; objetivo 2x en 2 meses |
 | v2.8 | Circuit breakers del documento: Fat Finger ±0.5%, Flash Crash Pauser BTC >3%/vela, Max Drawdown 15%, ATR trailing dinámico 1.5×, Kelly Criterion logger |
+| v2.9 | BTC momentum filter 1.5% (Holly AI), R:R mínimo 1.8:1, Sharpe+Sortino en startup, capital en historial diario |
 
 ---
 
