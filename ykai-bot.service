@@ -1,0 +1,48 @@
+# =============================================================
+#  YKAI Quant Core — systemd service (referencia / template)
+#
+#  Este archivo es una REFERENCIA. El deploy.sh genera la
+#  versión definitiva con rutas reales en /etc/systemd/system/
+#
+#  Instalación manual (si no usas deploy.sh):
+#    sudo cp ykai-bot.service /etc/systemd/system/ykai-bot.service
+#    # Editar User, WorkingDirectory, ExecStart con tus rutas
+#    sudo systemctl daemon-reload
+#    sudo systemctl enable ykai-bot
+#    sudo systemctl start ykai-bot
+# =============================================================
+
+[Unit]
+Description=YKAI Quant Core TradingBot v2.9
+Documentation=https://github.com/Umi-otoko/Ykai-SystemTrading
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Cambiar por tu usuario en Oracle Cloud (normalmente 'ubuntu' o 'opc')
+User=ubuntu
+
+# Ruta donde clonaste el repo
+WorkingDirectory=/home/ubuntu/BotTrader
+
+# Python del virtualenv + script principal
+ExecStart=/home/ubuntu/BotTrader/.venv/bin/python /home/ubuntu/BotTrader/TradingBot_v2.py
+
+# Reinicio automático si el proceso muere o crashea
+Restart=always
+RestartSec=30
+
+# Logs al archivo del bot (journalctl también los captura)
+StandardOutput=append:/home/ubuntu/BotTrader/trading.log
+StandardError=append:/home/ubuntu/BotTrader/trading.log
+
+# Fuerza flush inmediato de los prints de Python
+Environment=PYTHONUNBUFFERED=1
+
+# Límites de seguridad
+# PrivateTmp=true          # descomentar si quieres más aislamiento
+
+[Install]
+WantedBy=multi-user.target
