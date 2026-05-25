@@ -3,7 +3,7 @@ YKAI Quant Core — TradingBot v2
 Binance USD-M Futures Testnet | Capital: $50 | Riesgo: $1/trade
 DRY_RUN = True por defecto — no ejecuta órdenes hasta que lo cambies
 """
-
+from __future__ import annotations
 import os
 import json
 import time
