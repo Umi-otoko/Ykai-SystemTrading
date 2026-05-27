@@ -737,7 +737,11 @@ def evaluar_senal(simbolo: str) -> Senal | None:
 
     score_long = sum([c1, c2, c3, c4, c5, c6])
 
-    if score_long >= SCORE_MINIMO:
+    # FIX v2.10: score dinámico — si 1h Y 4h están alineados (c6=True), aceptar 4/6
+    # La macro confirmada doble vale como condición extra implícita
+    score_req_long = max(4, SCORE_MINIMO - (1 if c6 else 0))
+
+    if score_long >= score_req_long:
         if btc_dump:
             log.debug("LONG %s score %d/6 bloqueado — BTC dump %.2f%% en 1h", simbolo, score_long, momentum_btc*100)
         else:
@@ -747,12 +751,14 @@ def evaluar_senal(simbolo: str) -> Senal | None:
                           simbolo, rr_long, RR_MINIMO)
             else:
                 lev = calcular_leverage_optimo(precio, sl_long)
-                log.info("SEÑAL LONG %s | score %d/6 | 1h:%s 4h:%s | BTC mom:%.1f%% | precio %.4f | SL %.4f | TP1 %.4f | R:R %.1f:1 | lev %dx",
-                         simbolo, score_long, tendencia_1h, tendencia_4h, momentum_btc*100, precio, sl_long, tp1_long, rr_long, lev)
+                log.info("SEÑAL LONG %s | score %d/6 (req:%d) | 1h:%s 4h:%s | BTC mom:%.1f%% | precio %.4f | SL %.4f | TP1 %.4f | R:R %.1f:1 | lev %dx",
+                         simbolo, score_long, score_req_long, tendencia_1h, tendencia_4h, momentum_btc*100, precio, sl_long, tp1_long, rr_long, lev)
                 return Senal(simbolo, "LONG", score_long, precio, sl_long, tp1_long, tp2_long, lev, atr)
-    elif score_long == SCORE_MINIMO - 1:
-        log.debug("Cerca LONG %s | score %d/6 | 1h:%s 4h:%s | RSI %.1f",
-                  simbolo, score_long, tendencia_1h, tendencia_4h, curr["rsi"])
+    elif score_long == score_req_long - 1:
+        # FIX v2.10: desglose de condiciones para diagnóstico
+        conds = f"c1{'✓' if c1 else '✗'} c2{'✓' if c2 else '✗'} c3{'✓' if c3 else '✗'} c4{'✓' if c4 else '✗'} c5{'✓' if c5 else '✗'} c6{'✓' if c6 else '✗'}"
+        log.debug("Cerca LONG %s | score %d/6 (req:%d) | %s | RSI %.1f",
+                  simbolo, score_long, score_req_long, conds, curr["rsi"])
 
     # ── SHORT ───────────────────────────────────────────────────────────────
     sl_short  = precio + atr * ATR_MULT
@@ -775,7 +781,10 @@ def evaluar_senal(simbolo: str) -> Senal | None:
 
     score_short = sum([d1, d2, d3, d4, d5, d6])
 
-    if score_short >= SCORE_MINIMO:
+    # FIX v2.10: score dinámico — si 1h Y 4h están alineados (d6=True), aceptar 4/6
+    score_req_short = max(4, SCORE_MINIMO - (1 if d6 else 0))
+
+    if score_short >= score_req_short:
         if btc_pump:
             log.debug("SHORT %s score %d/6 bloqueado — BTC pump +%.2f%% en 1h", simbolo, score_short, momentum_btc*100)
         else:
@@ -785,12 +794,14 @@ def evaluar_senal(simbolo: str) -> Senal | None:
                           simbolo, rr_short, RR_MINIMO)
             else:
                 lev = calcular_leverage_optimo(precio, sl_short)
-                log.info("SEÑAL SHORT %s | score %d/6 | 1h:%s 4h:%s | BTC mom:%.1f%% | precio %.4f | SL %.4f | TP1 %.4f | R:R %.1f:1 | lev %dx",
-                         simbolo, score_short, tendencia_1h, tendencia_4h, momentum_btc*100, precio, sl_short, tp1_short, rr_short, lev)
+                log.info("SEÑAL SHORT %s | score %d/6 (req:%d) | 1h:%s 4h:%s | BTC mom:%.1f%% | precio %.4f | SL %.4f | TP1 %.4f | R:R %.1f:1 | lev %dx",
+                         simbolo, score_short, score_req_short, tendencia_1h, tendencia_4h, momentum_btc*100, precio, sl_short, tp1_short, rr_short, lev)
                 return Senal(simbolo, "SHORT", score_short, precio, sl_short, tp1_short, tp2_short, lev, atr)
-    elif score_short == SCORE_MINIMO - 1:
-        log.debug("Cerca SHORT %s | score %d/6 | 1h:%s 4h:%s | RSI %.1f",
-                  simbolo, score_short, tendencia_1h, tendencia_4h, curr["rsi"])
+    elif score_short == score_req_short - 1:
+        # FIX v2.10: desglose de condiciones para diagnóstico
+        conds = f"d1{'✓' if d1 else '✗'} d2{'✓' if d2 else '✗'} d3{'✓' if d3 else '✗'} d4{'✓' if d4 else '✗'} d5{'✓' if d5 else '✗'} d6{'✓' if d6 else '✗'}"
+        log.debug("Cerca SHORT %s | score %d/6 (req:%d) | %s | RSI %.1f",
+                  simbolo, score_short, score_req_short, conds, curr["rsi"])
 
     return None
 
