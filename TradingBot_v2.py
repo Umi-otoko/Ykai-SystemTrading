@@ -33,7 +33,7 @@ MAX_PERDIDA_DIA     = 4.4        # CB — con score 5/6 y filtro 4h, 3 SLs = mer
 MAX_TRADES_ABIERTOS = 3          # 3 posiciones — más oportunidades con anti-correlación Tier S
 
 LEVERAGE_MIN        = 1          # 1x mínimo — respeta el $1 de riesgo en pares volátiles
-LEVERAGE_MAX        = 15         # 15x máximo — captura el leverage óptimo en pares de bajo ATR%
+LEVERAGE_MAX        = 5          # 5x máximo — cap conservador, evita sobreexposición en pares de bajo ATR
 TAMANO_MINIMO_USD   = 15.0       # descarta trades con posición < $15 (evita polvo)
 
 EMA_RAPIDA          = 20
@@ -77,8 +77,10 @@ COOLDOWN_SL_SEGUNDOS = 7200      # 2h sin re-entrar al mismo símbolo tras SL (a
 
 # Tier S: alta correlación entre sí — máx 1 en la misma dirección simultáneamente
 # Tier A: menor correlación con Tier S — pueden coexistir con cualquier Tier S
-TIER_S  = {"BTC/USDT", "ETH/USDT", "SOL/USDT"}
-ACTIVOS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "BNB/USDT"]
+# XRP eliminado: 50% SL rate (10 SLs / 20 trades, 1 TP2) — net negativo
+# SOL eliminado: 78% SL rate (7 SLs / 9 trades, 0 TP2) — peor performer
+TIER_S  = {"BTC/USDT", "ETH/USDT"}
+ACTIVOS = ["BTC/USDT", "ETH/USDT", "DOGE/USDT", "BNB/USDT"]
 
 # ==============================================================================
 # LOGGING
@@ -1136,7 +1138,7 @@ def main() -> None:
     estado = cargar_estado()
     modo = "DRY-RUN (simulación)" if DRY_RUN else "⚠️  REAL EN TESTNET"
     log.info("=" * 60)
-    log.info("YKAI TradingBot v2.9 iniciado — modo: %s", modo)
+    log.info("YKAI TradingBot v2.11 iniciado — modo: %s", modo)
     log.info("Capital actual: $%.2f | Pico: $%.2f | Riesgo/trade: $%.2f (%.0f%%) | CB diario: $%.2f | Max DD: %.0f%%",
              estado.capital_actual, estado.capital_pico, calcular_riesgo_actual(),
              RIESGO_PCT * 100, MAX_PERDIDA_DIA, MAX_DRAWDOWN_PCT * 100)
