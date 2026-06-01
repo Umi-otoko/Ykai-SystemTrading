@@ -30,7 +30,8 @@ RIESGO_PCT          = 0.02       # 2% del capital actual por trade — COMPOUNDI
 RIESGO_MIN_USD      = 0.50       # piso: nunca arriesgar menos de $0.50
 RIESGO_MAX_USD      = 5.00       # techo: máximo $5.00/trade (limita exposición hasta $250 capital)
 MAX_PERDIDA_DIA     = 4.4        # CB — con score 5/6 y filtro 4h, 3 SLs = mercado adverso
-MAX_TRADES_ABIERTOS = 3          # 3 posiciones — más oportunidades con anti-correlación Tier S
+MAX_TRADES_ABIERTOS = 3          # 3 posiciones total
+MAX_MISMA_DIRECCION = 2          # máx 2 en la misma dirección — evita 3 SHORTs correlacionados que se van al SL juntos
 
 LEVERAGE_MIN        = 1          # 1x mínimo — respeta el $1 de riesgo en pares volátiles
 LEVERAGE_MAX        = 5          # 5x máximo — cap conservador, evita sobreexposición en pares de bajo ATR
@@ -41,7 +42,7 @@ EMA_MEDIA           = 50
 EMA_LENTA           = 200
 RSI_PERIODO         = 14
 ATR_PERIODO         = 14
-ATR_MULT            = 1.5        # SL más amplio — 1.5× ATR filtra ruido de mercado
+ATR_MULT            = 2.0        # SL amplio — 2.0× ATR absorbe ruido intraday (rebotes 0.5-1% en crypto)
 VOLUMEN_MULT        = 1.5        # volumen debe ser 1.5× la media (más estricto = menos falsos positivos)
 ATR_MIN_PCT         = 0.0012     # ATR mínimo 0.12% del precio — descarta mercados planos/chop
 
@@ -820,17 +821,26 @@ def _crear_orden_market(simbolo: str, lado: str, cantidad: float) -> dict:
     return exchange.create_order(simbolo, "market", lado, cantidad)
 
 def _puede_abrir_por_correlacion(simbolo: str, direccion: str) -> bool:
-    """Anti-correlación Tier S: máximo 1 trade de BTC/ETH/SOL en la misma dirección.
-    Evita el desastre de 3 Tier S correlacionados que se van al SL juntos."""
-    if simbolo not in TIER_S:
-        return True  # Tier A: sin restricción de correlación
-    tier_s_activos = sum(
-        1 for sym, pos in estado.posiciones.items()
-        if sym in TIER_S and pos.direccion == direccion
+    """Anti-correlación: máx 1 Tier S por dirección + máx MAX_MISMA_DIRECCION total.
+    Evita el desastre de 3 cortos correlacionados que se van al SL juntos en el mismo rebote."""
+    # Regla 1: máx 1 Tier S en la misma dirección
+    if simbolo in TIER_S:
+        tier_s_activos = sum(
+            1 for sym, pos in estado.posiciones.items()
+            if sym in TIER_S and pos.direccion == direccion
+        )
+        if tier_s_activos >= 1:
+            log.debug("Anti-correlación Tier S: ya hay %d en %s — %s descartado",
+                      tier_s_activos, direccion, simbolo)
+            return False
+    # Regla 2: máx MAX_MISMA_DIRECCION posiciones en la misma dirección (Tier A incluido)
+    misma_dir = sum(
+        1 for pos in estado.posiciones.values()
+        if pos.direccion == direccion
     )
-    if tier_s_activos >= 1:
-        log.debug("Anti-correlación: ya hay %d Tier S en %s — %s descartado",
-                  tier_s_activos, direccion, simbolo)
+    if misma_dir >= MAX_MISMA_DIRECCION:
+        log.debug("Anti-correlación global: ya hay %d posiciones %s — %s descartado",
+                  misma_dir, direccion, simbolo)
         return False
     return True
 
@@ -1138,7 +1148,7 @@ def main() -> None:
     estado = cargar_estado()
     modo = "DRY-RUN (simulación)" if DRY_RUN else "⚠️  REAL EN TESTNET"
     log.info("=" * 60)
-    log.info("YKAI TradingBot v2.11 iniciado — modo: %s", modo)
+    log.info("YKAI TradingBot v2.12 iniciado — modo: %s", modo)
     log.info("Capital actual: $%.2f | Pico: $%.2f | Riesgo/trade: $%.2f (%.0f%%) | CB diario: $%.2f | Max DD: %.0f%%",
              estado.capital_actual, estado.capital_pico, calcular_riesgo_actual(),
              RIESGO_PCT * 100, MAX_PERDIDA_DIA, MAX_DRAWDOWN_PCT * 100)
