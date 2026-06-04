@@ -28,7 +28,7 @@ DRY_RUN             = True       # ← cambiar a False para órdenes reales en t
 CAPITAL_USD         = 50.0       # capital inicial de referencia
 RIESGO_PCT          = 0.02       # 2% del capital actual por trade — COMPOUNDING automático
 RIESGO_MIN_USD      = 0.50       # piso: nunca arriesgar menos de $0.50
-RIESGO_MAX_USD      = 5.00       # techo: máximo $5.00/trade (limita exposición hasta $250 capital)
+RIESGO_MAX_USD      = 10.00      # techo: máximo $10.00/trade (limita exposición hasta $500 capital)
 MAX_PERDIDA_DIA     = 4.4        # CB — con score 5/6 y filtro 4h, 3 SLs = mercado adverso
 MAX_TRADES_ABIERTOS = 3          # 3 posiciones total
 MAX_MISMA_DIRECCION = 2          # máx 2 en la misma dirección — evita 3 SHORTs correlacionados que se van al SL juntos
@@ -1148,7 +1148,7 @@ def main() -> None:
     estado = cargar_estado()
     modo = "DRY-RUN (simulación)" if DRY_RUN else "⚠️  REAL EN TESTNET"
     log.info("=" * 60)
-    log.info("YKAI TradingBot v2.12 iniciado — modo: %s", modo)
+    log.info("YKAI TradingBot v2.13 iniciado — modo: %s", modo)
     log.info("Capital actual: $%.2f | Pico: $%.2f | Riesgo/trade: $%.2f (%.0f%%) | CB diario: $%.2f | Max DD: %.0f%%",
              estado.capital_actual, estado.capital_pico, calcular_riesgo_actual(),
              RIESGO_PCT * 100, MAX_PERDIDA_DIA, MAX_DRAWDOWN_PCT * 100)
