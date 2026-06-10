@@ -42,6 +42,18 @@ EMA_MEDIA           = 50
 EMA_LENTA           = 200
 RSI_PERIODO         = 14
 ATR_PERIODO         = 14
+
+# FILTRO DE RÉGIMEN (ADX en 1h) — v2.14
+# El ADX mide la FUERZA de la tendencia. El backtest sobre 16 días reales (126 trades)
+# reveló un resultado CONTRAINTUITIVO, validado en $:
+#   ADX < 20     (rango)        → WR 86%, PnL +$22.33  ✅ el sistema scalpea bien aquí
+#   ADX 20-25    (transición)   → WR 32%, PnL -$15.98  ❌ "valle de la muerte"
+#   ADX >= 25    (tendencia)    → WR 68%, PnL +$36.38  ✅ el sistema surfea la tendencia
+# Conclusión: el sangrado NO está en el rango, está en la TRANSICIÓN 20-25 (tendencia
+# naciente que falla o tendencia muriendo). Bloquear esa banda sube el PnL +37%.
+ADX_PERIODO              = 14
+ADX_ZONA_MUERTE_MIN      = 20.0   # banda 20-25 = transición ruidosa → NO operar
+ADX_ZONA_MUERTE_MAX      = 25.0
 ATR_MULT            = 2.0        # SL amplio — 2.0× ATR absorbe ruido intraday (rebotes 0.5-1% en crypto)
 VOLUMEN_MULT        = 1.5        # volumen debe ser 1.5× la media (más estricto = menos falsos positivos)
 ATR_MIN_PCT         = 0.0012     # ATR mínimo 0.12% del precio — descarta mercados planos/chop
@@ -610,6 +622,34 @@ def calcular_atr(df: pd.DataFrame, periodo: int = 14) -> pd.Series:
     )
     return tr.ewm(span=periodo, adjust=False).mean()
 
+def calcular_adx(df: pd.DataFrame, periodo: int = 14) -> pd.Series:
+    """ADX de Wilder — mide la FUERZA de la tendencia (no la dirección).
+    ADX > 25 = tendencia fuerte | 20-25 = débil | < 20 = rango/chop.
+    Usa suavizado de Wilder (alpha=1/periodo) para coincidir con el ADX estándar
+    de TradingView/Binance, así los umbrales 20/25 son comparables."""
+    high, low, close = df["high"], df["low"], df["close"]
+
+    up_move   = high.diff()
+    down_move = -low.diff()
+
+    plus_dm  = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),   index=df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+
+    tr = np.maximum(
+        high - low,
+        np.maximum((high - close.shift(1)).abs(), (low - close.shift(1)).abs()),
+    )
+
+    alpha   = 1.0 / periodo  # suavizado de Wilder
+    atr_w   = tr.ewm(alpha=alpha, adjust=False).mean()
+    plus_di  = 100 * plus_dm.ewm(alpha=alpha,  adjust=False).mean() / atr_w
+    minus_di = 100 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_w
+
+    suma = (plus_di + minus_di).replace(0, np.nan)
+    dx   = 100 * (plus_di - minus_di).abs() / suma
+    adx  = dx.ewm(alpha=alpha, adjust=False).mean()
+    return adx.fillna(0)
+
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["ema20"]  = calcular_ema(df["close"], EMA_RAPIDA)
@@ -617,6 +657,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["ema200"] = calcular_ema(df["close"], EMA_LENTA)
     df["rsi"]    = calcular_rsi(df["close"], RSI_PERIODO)
     df["atr"]    = calcular_atr(df, ATR_PERIODO)
+    df["adx"]    = calcular_adx(df, ADX_PERIODO)
     df["vol_med"]= df["volume"].rolling(20).mean()
     return df
 
@@ -624,19 +665,22 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 # TENDENCIA EN TIMEFRAME ALTO (1h)
 # ==============================================================================
 
-def obtener_tendencia_1h(simbolo: str) -> str:
-    """Retorna 'ALCISTA', 'BAJISTA' o 'NEUTRAL' según EMA20/50/200 en 1h."""
+def obtener_tendencia_1h(simbolo: str) -> tuple:
+    """Retorna (tendencia, adx) en 1h.
+    tendencia ∈ {'ALCISTA','BAJISTA','NEUTRAL'} según EMA20/50/200.
+    adx = fuerza de la tendencia (vela -2, ya cerrada, para no usar valor en formación)."""
     try:
         df = calcular_indicadores(obtener_velas(simbolo, TF_TENDENCIA, 250))
-        u  = df.iloc[-1]
+        u   = df.iloc[-1]
+        adx = float(df["adx"].iloc[-2])  # vela cerrada — el ADX en formación repinta
         if u["ema20"] > u["ema50"] > u["ema200"]:
-            return "ALCISTA"
+            return "ALCISTA", adx
         if u["ema20"] < u["ema50"] < u["ema200"]:
-            return "BAJISTA"
-        return "NEUTRAL"
+            return "BAJISTA", adx
+        return "NEUTRAL", adx
     except Exception as e:
         log.warning("Error tendencia 1h %s: %s", simbolo, e)
-        return "NEUTRAL"
+        return "NEUTRAL", 0.0
 
 def obtener_tendencia_macro(simbolo: str) -> str:
     """Tendencia en 4h con caché — no llama a la API en cada ciclo de 20s."""
@@ -680,7 +724,17 @@ def calcular_leverage_optimo(precio_entrada: float, precio_sl: float) -> int:
 # ==============================================================================
 
 def evaluar_senal(simbolo: str) -> Senal | None:
-    tendencia_1h = obtener_tendencia_1h(simbolo)
+    tendencia_1h, adx_1h = obtener_tendencia_1h(simbolo)
+
+    # ── FILTRO DE RÉGIMEN (ADX 1h) — v2.14 ──────────────────────────────────
+    # Backtest validado en $: la banda 20-25 (transición de régimen) es el "valle
+    # de la muerte" — WR 32%, PnL -$15.98. Tendencia naciente que falla o tendencia
+    # muriendo. Bloquearla sube el PnL del sistema +37%.
+    # El rango (<20) y la tendencia (>=25) SÍ son rentables, no se tocan.
+    if ADX_ZONA_MUERTE_MIN <= adx_1h < ADX_ZONA_MUERTE_MAX:
+        log.debug("Zona muerte %s | ADX 1h %.1f en [%.0f-%.0f) — transición ruidosa, no se opera",
+                  simbolo, adx_1h, ADX_ZONA_MUERTE_MIN, ADX_ZONA_MUERTE_MAX)
+        return None
 
     try:
         df = calcular_indicadores(obtener_velas(simbolo, TF_ENTRADA, 250))
@@ -741,7 +795,6 @@ def evaluar_senal(simbolo: str) -> Senal | None:
     score_long = sum([c1, c2, c3, c4, c5, c6])
 
     # FIX v2.10: score dinámico — si 1h Y 4h están alineados (c6=True), aceptar 4/6
-    # La macro confirmada doble vale como condición extra implícita
     score_req_long = max(4, SCORE_MINIMO - (1 if c6 else 0))
 
     if score_long >= score_req_long:
@@ -754,8 +807,8 @@ def evaluar_senal(simbolo: str) -> Senal | None:
                           simbolo, rr_long, RR_MINIMO)
             else:
                 lev = calcular_leverage_optimo(precio, sl_long)
-                log.info("SEÑAL LONG %s | score %d/6 (req:%d) | 1h:%s 4h:%s | BTC mom:%.1f%% | precio %.4f | SL %.4f | TP1 %.4f | R:R %.1f:1 | lev %dx",
-                         simbolo, score_long, score_req_long, tendencia_1h, tendencia_4h, momentum_btc*100, precio, sl_long, tp1_long, rr_long, lev)
+                log.info("SEÑAL LONG %s | score %d/6 (req:%d) | 1h:%s 4h:%s | ADX %.0f | BTC mom:%.1f%% | precio %.4f | SL %.4f | TP1 %.4f | R:R %.1f:1 | lev %dx",
+                         simbolo, score_long, score_req_long, tendencia_1h, tendencia_4h, adx_1h, momentum_btc*100, precio, sl_long, tp1_long, rr_long, lev)
                 return Senal(simbolo, "LONG", score_long, precio, sl_long, tp1_long, tp2_long, lev, atr)
     elif score_long == score_req_long - 1:
         # FIX v2.10: desglose de condiciones para diagnóstico
@@ -797,8 +850,8 @@ def evaluar_senal(simbolo: str) -> Senal | None:
                           simbolo, rr_short, RR_MINIMO)
             else:
                 lev = calcular_leverage_optimo(precio, sl_short)
-                log.info("SEÑAL SHORT %s | score %d/6 (req:%d) | 1h:%s 4h:%s | BTC mom:%.1f%% | precio %.4f | SL %.4f | TP1 %.4f | R:R %.1f:1 | lev %dx",
-                         simbolo, score_short, score_req_short, tendencia_1h, tendencia_4h, momentum_btc*100, precio, sl_short, tp1_short, rr_short, lev)
+                log.info("SEÑAL SHORT %s | score %d/6 (req:%d) | 1h:%s 4h:%s | ADX %.0f | BTC mom:%.1f%% | precio %.4f | SL %.4f | TP1 %.4f | R:R %.1f:1 | lev %dx",
+                         simbolo, score_short, score_req_short, tendencia_1h, tendencia_4h, adx_1h, momentum_btc*100, precio, sl_short, tp1_short, rr_short, lev)
                 return Senal(simbolo, "SHORT", score_short, precio, sl_short, tp1_short, tp2_short, lev, atr)
     elif score_short == score_req_short - 1:
         # FIX v2.10: desglose de condiciones para diagnóstico
@@ -1148,7 +1201,7 @@ def main() -> None:
     estado = cargar_estado()
     modo = "DRY-RUN (simulación)" if DRY_RUN else "⚠️  REAL EN TESTNET"
     log.info("=" * 60)
-    log.info("YKAI TradingBot v2.13 iniciado — modo: %s", modo)
+    log.info("YKAI TradingBot v2.14 iniciado — modo: %s", modo)
     log.info("Capital actual: $%.2f | Pico: $%.2f | Riesgo/trade: $%.2f (%.0f%%) | CB diario: $%.2f | Max DD: %.0f%%",
              estado.capital_actual, estado.capital_pico, calcular_riesgo_actual(),
              RIESGO_PCT * 100, MAX_PERDIDA_DIA, MAX_DRAWDOWN_PCT * 100)
