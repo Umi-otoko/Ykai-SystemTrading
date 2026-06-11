@@ -28,8 +28,8 @@ load_dotenv()
 #   DRY_RUN=True               → solo simula, no envía órdenes (estado actual)
 #   DRY_RUN=False, TESTNET=True → órdenes reales en TESTNET (dinero falso, fills reales)
 #   DRY_RUN=False, TESTNET=False→ ⚠️ DINERO REAL en mainnet Binance
-DRY_RUN             = True       # ← False para ejecutar órdenes
-USAR_TESTNET        = True       # ← False para mainnet (dinero real). Dejar True hasta validar.
+DRY_RUN             = False      # PASO 1: ejecuta órdenes reales...
+USAR_TESTNET        = True       # ...pero en TESTNET (dinero falso, fills reales). Validación 1 semana.
 
 CAPITAL_USD         = 50.0       # capital inicial de referencia
 RIESGO_PCT          = 0.02       # 2% del capital actual por trade — COMPOUNDING automático
