@@ -67,7 +67,7 @@ with open(LOG, encoding="utf-8", errors="ignore") as f:
                     porcion = notional
             else:
                 porcion, horas = 200.0, 4.0      # fallback
-            eventos.append((t_cierre, sym, pnl, porcion, horas))
+            eventos.append((t_cierre, sym, pnl, porcion, horas, tipo))
 
 eventos.sort(key=lambda e: e[0])
 print(f"Eventos de cierre parseados: {len(eventos)}")
@@ -77,8 +77,9 @@ pnl_bruto_dia = defaultdict(float)
 pnl_neto_dia  = defaultdict(float)
 costo_total = 0.0
 
-for t_cierre, sym, pnl, porcion, horas in eventos:
-    costo = qm.costo_total_trade(porcion, horas)
+for t_cierre, sym, pnl, porcion, horas, tipo in eventos:
+    salida = "maker" if tipo in ("TP1 parcial", "TP2") else "taker"  # TP=limit, SL=market
+    costo = qm.costo_total_trade(porcion, horas, entrada_tipo="maker", salida_tipo=salida)
     costo_total += costo
     dia = t_cierre.date()
     pnl_bruto_dia[dia] += pnl

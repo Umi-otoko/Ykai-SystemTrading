@@ -23,7 +23,13 @@ load_dotenv()
 # CONFIGURACIÓN — edita solo esta sección
 # ==============================================================================
 
-DRY_RUN             = True       # ← cambiar a False para órdenes reales en testnet
+# ── INTERRUPTORES DE EJECUCIÓN ─────────────────────────────────────────────────
+# Matriz de seguridad para el go-live:
+#   DRY_RUN=True               → solo simula, no envía órdenes (estado actual)
+#   DRY_RUN=False, TESTNET=True → órdenes reales en TESTNET (dinero falso, fills reales)
+#   DRY_RUN=False, TESTNET=False→ ⚠️ DINERO REAL en mainnet Binance
+DRY_RUN             = True       # ← False para ejecutar órdenes
+USAR_TESTNET        = True       # ← False para mainnet (dinero real). Dejar True hasta validar.
 
 CAPITAL_USD         = 50.0       # capital inicial de referencia
 RIESGO_PCT          = 0.02       # 2% del capital actual por trade — COMPOUNDING automático
@@ -78,14 +84,21 @@ CACHE_BTC_MOM_SECS  = 60         # refrescar momentum BTC cada 60s
 
 RR_MINIMO           = 1.8        # ratio R:R mínimo TP2/SL — rechaza trades con potencial insuficiente
 
-# ── COSTOS DE TRANSACCIÓN — v2.15 ──────────────────────────────────────────────
-# El #1 destructor de alfa (Manual Quant + ML4T). El PnL DRY-RUN ahora descuenta
-# costos reales para que las métricas en vivo NO sean ficción optimista.
-# Square-Root Law confirmó: market impact irrelevante para órdenes retail → solo
-# comisión + slippage + funding.
-COMISION_TAKER_PCT  = 0.0005     # Binance Futures USDT-M taker: 0.05% por lado
-SLIPPAGE_PCT        = 0.0002     # slippage estimado pares líquidos: 0.02%/lado
+# ── COSTOS DE TRANSACCIÓN — v2.15 / v2.16 ──────────────────────────────────────
+# El #1 destructor de alfa (Manual Quant + ML4T). El backtest honesto mostró que
+# los costos se comían el 78% del PnL bruto operando a TAKER (market).
+# v2.16: entradas y TPs por LIMIT (maker 0.02%, sin slippage — provees liquidez);
+# solo el SL se ejecuta a TAKER (market al tocarse). Recorta ~70% del costo RT.
+COMISION_MAKER_PCT  = 0.0002     # Binance Futures USDT-M maker: 0.02% por lado (limit)
+COMISION_TAKER_PCT  = 0.0005     # taker: 0.05% por lado (market — solo SL)
+SLIPPAGE_PCT        = 0.0002     # slippage taker pares líquidos: 0.02% (maker ≈ 0)
 FUNDING_8H_PCT      = 0.0001     # funding ~0.01% cada 8h
+USAR_LIMIT_ENTRADA  = True       # entradas con limit post-only (maker). Si no llena → señal perdida
+LIMIT_TIMEOUT_SEG   = 45         # si la orden limit no llena en 45s, se cancela
+
+# ── FILTRO DE SPREAD — v2.16 ───────────────────────────────────────────────────
+# No entrar si el spread bid-ask es alto: cruzarlo cuesta más que el edge esperado.
+MAX_SPREAD_PCT      = 0.0006     # 0.06% — spread máximo aceptable para abrir
 
 # ── TIME-STOP — v2.15 (concepto half-life Ornstein-Uhlenbeck) ──────────────────
 # Una posición que no resuelve en N horas pierde su edge (la señal caducó).
@@ -166,12 +179,16 @@ def crear_exchange() -> ccxt.binanceusdm:
         },
     })
 
-    # Redirigir al testnet
-    if isinstance(ex.urls.get("api"), dict):
-        for k, url in ex.urls["api"].items():
-            if isinstance(url, str) and "fapi.binance.com" in url:
-                ex.urls["api"][k] = url.replace("fapi.binance.com", "testnet.binancefuture.com")
-    ex.options["testnet"] = True
+    # Redirigir al testnet SOLO si USAR_TESTNET. En mainnet se usan las URLs reales.
+    if USAR_TESTNET:
+        if isinstance(ex.urls.get("api"), dict):
+            for k, url in ex.urls["api"].items():
+                if isinstance(url, str) and "fapi.binance.com" in url:
+                    ex.urls["api"][k] = url.replace("fapi.binance.com", "testnet.binancefuture.com")
+        ex.options["testnet"] = True
+        log.info("Exchange: Binance Futures TESTNET (dinero simulado)")
+    else:
+        log.warning("⚠️  Exchange: Binance Futures MAINNET — DINERO REAL")
 
     return ex
 
@@ -269,12 +286,21 @@ def calcular_riesgo_actual() -> float:
         riesgo *= DERISK_FACTOR   # anti-martingala: bajar tamaño mientras se pierde
     return round(max(RIESGO_MIN_USD, min(riesgo, RIESGO_MAX_USD)), 2)
 
-def costo_trade(notional_usd: float, horas_abierto: float = 0.0) -> float:
-    """Costo realista de un trade: comisión+slippage round-trip + funding. v2.15.
-    Se descuenta del PnL para que las métricas no sean ficción optimista."""
-    round_trip = notional_usd * (COMISION_TAKER_PCT + SLIPPAGE_PCT) * 2
-    funding    = notional_usd * FUNDING_8H_PCT * (horas_abierto / 8.0)
-    return round_trip + funding
+def _costo_lado(notional_usd: float, tipo: str) -> float:
+    """Costo de un lado de la operación. maker (limit) = solo comisión 0.02%;
+    taker (market) = comisión 0.05% + slippage."""
+    if tipo == "maker":
+        return notional_usd * COMISION_MAKER_PCT
+    return notional_usd * (COMISION_TAKER_PCT + SLIPPAGE_PCT)
+
+def costo_trade(notional_usd: float, horas_abierto: float = 0.0,
+                salida_tipo: str = "taker") -> float:
+    """Costo realista de un trade. v2.16: entrada siempre maker (limit post-only);
+    la salida es maker si fue TP (limit) o taker si fue SL (market al tocarse)."""
+    entrada = _costo_lado(notional_usd, "maker" if USAR_LIMIT_ENTRADA else "taker")
+    salida  = _costo_lado(notional_usd, salida_tipo)
+    funding = notional_usd * FUNDING_8H_PCT * (horas_abierto / 8.0)
+    return entrada + salida + funding
 
 # Caché de tendencia 4h (no llamar a la API en cada ciclo de 20s)
 _cache_macro: dict = {}   # simbolo → (datetime, "ALCISTA"|"BAJISTA"|"NEUTRAL")
@@ -916,6 +942,32 @@ def _set_leverage(simbolo: str, leverage: int) -> None:
 def _crear_orden_market(simbolo: str, lado: str, cantidad: float) -> dict:
     return exchange.create_order(simbolo, "market", lado, cantidad)
 
+def _abrir_con_limit(simbolo: str, lado: str, cantidad: float, precio_limite: float) -> bool:
+    """v2.16: entrada con LIMIT post-only (maker, fee 0.02%). Espera el fill hasta
+    LIMIT_TIMEOUT_SEG; si no llena, cancela. Retorna True si llenó.
+    Compromiso: ahorra ~70% del costo vs market, pero algunas señales se pierden
+    si el precio se aleja antes del fill — disciplina sobre coste."""
+    precio_n = float(exchange.price_to_precision(simbolo, precio_limite))
+    orden = exchange.create_order(simbolo, "limit", lado, cantidad, precio_n, {"postOnly": True})
+    oid = orden.get("id")
+    t0 = time.time()
+    while time.time() - t0 < LIMIT_TIMEOUT_SEG:
+        time.sleep(3)
+        try:
+            o = exchange.fetch_order(oid, simbolo)
+        except ccxt.BaseError:
+            continue
+        if o.get("status") == "closed":
+            log.info("Limit entrada %s llenó @ %.4f (maker, fee 0.02%%)", simbolo, precio_n)
+            return True
+        if o.get("status") == "canceled":
+            return False
+    try:
+        exchange.cancel_order(oid, simbolo)
+    except ccxt.BaseError:
+        pass
+    return False
+
 def _puede_abrir_por_correlacion(simbolo: str, direccion: str) -> bool:
     """Anti-correlación: máx 1 Tier S por dirección + máx MAX_MISMA_DIRECCION total.
     Evita el desastre de 3 cortos correlacionados que se van al SL juntos en el mismo rebote."""
@@ -963,6 +1015,11 @@ def abrir_posicion(senal: Senal) -> None:
     if en_noticia:
         log.info("📰 Noticia alto impacto (%s) ±%dmin — %s no se abre",
                  etiqueta, NOTICIAS_MARGEN_MIN, senal.simbolo)
+        return
+    sp = spread_pct(senal.simbolo)
+    if sp > MAX_SPREAD_PCT:
+        log.info("Spread alto %s: %.3f%% > %.3f%% — no se abre (cruzarlo cuesta más que el edge)",
+                 senal.simbolo, sp * 100, MAX_SPREAD_PCT * 100)
         return
     if not _puede_abrir_por_correlacion(senal.simbolo, senal.direccion):
         return
@@ -1014,8 +1071,14 @@ def abrir_posicion(senal: Senal) -> None:
     else:
         try:
             _set_leverage(senal.simbolo, senal.leverage)
-            orden = _crear_orden_market(senal.simbolo, lado, round(cantidad, 3))
-            log.info("Orden ejecutada: %s", orden.get("id", "?"))
+            if USAR_LIMIT_ENTRADA:
+                if not _abrir_con_limit(senal.simbolo, lado, round(cantidad, 3), senal.precio):
+                    log.info("Limit entrada %s no llenó en %ds — señal descartada (ahorra fee taker)",
+                             senal.simbolo, LIMIT_TIMEOUT_SEG)
+                    return
+            else:
+                orden = _crear_orden_market(senal.simbolo, lado, round(cantidad, 3))
+                log.info("Orden ejecutada (market): %s", orden.get("id", "?"))
         except ccxt.BaseError as e:
             log.error("Error al abrir posición %s: %s", senal.simbolo, e)
             return
@@ -1046,6 +1109,19 @@ def simbolo_ya_abierto(simbolo: str) -> bool:
 def precio_actual(simbolo: str) -> float:
     ticker = exchange.fetch_ticker(simbolo)
     return float(ticker["last"])
+
+def spread_pct(simbolo: str) -> float:
+    """Spread bid-ask actual como fracción del precio. v2.16.
+    Si el spread es alto, cruzarlo cuesta más que el edge — no conviene entrar."""
+    try:
+        t = exchange.fetch_ticker(simbolo)
+        bid, ask = float(t["bid"]), float(t["ask"])
+        if bid <= 0 or ask <= 0:
+            return 0.0
+        return (ask - bid) / ((ask + bid) / 2.0)
+    except Exception as e:
+        log.debug("Error spread %s: %s", simbolo, e)
+        return 0.0
 
 def actualizar_trailing(pos: Posicion, precio: float) -> None:
     """Tras TP1: trailing stop dinámico basado en ATR (doc: Trailing_Stop = SIC ± Mult×ATR).
@@ -1121,8 +1197,8 @@ def cerrar_parcial(pos: Posicion, precio_scan: float, motivo: str) -> None:
     # Usar precio exacto del TP1, no el precio del scan (puede ser mejor o peor)
     precio_calc = pos.precio_tp1
     ganancia = abs(precio_calc - pos.precio_entrada) / pos.precio_entrada * pos.tamano_usd * TP1_CIERRE_PCT
-    # v2.15: descontar costos reales de la porción cerrada (comisión+slippage)
-    ganancia -= costo_trade(pos.tamano_usd * TP1_CIERRE_PCT)
+    # v2.16: TP1 sale por limit (maker) — costo reducido
+    ganancia -= costo_trade(pos.tamano_usd * TP1_CIERRE_PCT, salida_tipo="maker")
     pos.tp1_cerrado = True
     # Mover SL a breakeven — la operación ya no puede perder
     pos.precio_sl = pos.precio_entrada
@@ -1169,9 +1245,10 @@ def cerrar_posicion(pos: Posicion, precio_scan: float, motivo: str) -> None:
         signo = 1 if precio_calc > pos.precio_entrada else -1
 
     pnl = pct * pos.tamano_usd * factor * signo
-    # v2.15: descontar costos reales (comisión+slippage round-trip + funding por horas)
+    # v2.16: descontar costos reales. TP2 sale por limit (maker); SL/Trail/TimeStop por market (taker)
     horas_abierto = (datetime.now(timezone.utc).replace(tzinfo=None) - pos.timestamp).total_seconds() / 3600.0
-    pnl -= costo_trade(pos.tamano_usd * factor, horas_abierto)
+    salida_tipo   = "maker" if motivo == "TP2" else "taker"
+    pnl -= costo_trade(pos.tamano_usd * factor, horas_abierto, salida_tipo=salida_tipo)
 
     if DRY_RUN:
         log.info("[DRY-RUN] CERRAR %s %s @ %.4f (%s) | PnL $%.2f",
@@ -1276,9 +1353,14 @@ def ciclo() -> None:
 def main() -> None:
     global estado
     estado = cargar_estado()
-    modo = "DRY-RUN (simulación)" if DRY_RUN else "⚠️  REAL EN TESTNET"
+    if DRY_RUN:
+        modo = "DRY-RUN (simulación)"
+    elif USAR_TESTNET:
+        modo = "REAL EN TESTNET (dinero falso)"
+    else:
+        modo = "⚠️  DINERO REAL — MAINNET"
     log.info("=" * 60)
-    log.info("YKAI TradingBot v2.15 iniciado — modo: %s", modo)
+    log.info("YKAI TradingBot v2.16 iniciado — modo: %s", modo)
     log.info("Capital actual: $%.2f | Pico: $%.2f | Riesgo/trade: $%.2f (%.0f%%) | CB diario: $%.2f | Max DD: %.0f%%",
              estado.capital_actual, estado.capital_pico, calcular_riesgo_actual(),
              RIESGO_PCT * 100, MAX_PERDIDA_DIA, MAX_DRAWDOWN_PCT * 100)
@@ -1299,11 +1381,12 @@ def main() -> None:
     log.info("Max posiciones: %d | Score mínimo: %d/6 | Trail factor: %.1f",
              MAX_TRADES_ABIERTOS, SCORE_MINIMO, TRAIL_FACTOR)
     log.info("Scan cada %ds | TF tendencia: %s | TF entrada: %s", INTERVALO_SCAN, TF_TENDENCIA, TF_ENTRADA)
-    log.info("Costos: comisión %.3f%% + slippage %.3f%% (RT %.2f%%) | Time-stop: %dh | De-risk: %d SLs→x%.1f",
-             COMISION_TAKER_PCT*100, SLIPPAGE_PCT*100, (COMISION_TAKER_PCT+SLIPPAGE_PCT)*2*100,
-             MAX_HORAS_POSICION, SL_CONSECUTIVOS_DERISK, DERISK_FACTOR)
-    log.info("Filtro noticias: %d eventos cargados, ±%dmin | Filtro régimen ADX: zona muerte [%.0f-%.0f)",
-             len(NOTICIAS_ALTO_IMPACTO), NOTICIAS_MARGEN_MIN, ADX_ZONA_MUERTE_MIN, ADX_ZONA_MUERTE_MAX)
+    _modo_entrada = "LIMIT maker 0.02%" if USAR_LIMIT_ENTRADA else "market taker 0.05%"
+    log.info("Costos: entrada %s | TP maker, SL taker | Time-stop: %dh | De-risk: %d SLs→x%.1f",
+             _modo_entrada, MAX_HORAS_POSICION, SL_CONSECUTIVOS_DERISK, DERISK_FACTOR)
+    log.info("Filtros: noticias %d ev ±%dmin | spread máx %.3f%% | régimen ADX zona muerte [%.0f-%.0f)",
+             len(NOTICIAS_ALTO_IMPACTO), NOTICIAS_MARGEN_MIN, MAX_SPREAD_PCT*100,
+             ADX_ZONA_MUERTE_MIN, ADX_ZONA_MUERTE_MAX)
     log.info("=" * 60)
 
     enviar_telegram(

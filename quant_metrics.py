@@ -16,25 +16,31 @@ from scipy import stats
 # ──────────────────────────────────────────────────────────────────────────────
 # COSTOS DE TRANSACCIÓN  (el #1 destructor de alfa según ambas fuentes)
 # ──────────────────────────────────────────────────────────────────────────────
-COMISION_TAKER_PCT = 0.0005   # Binance Futures USDT-M taker: 0.05% por lado
-SLIPPAGE_PCT       = 0.0002   # estimado pares líquidos (BTC/ETH/DOGE/BNB): 0.02%
+COMISION_MAKER_PCT = 0.0002   # Binance Futures USDT-M maker (limit): 0.02% por lado
+COMISION_TAKER_PCT = 0.0005   # taker (market): 0.05% por lado
+SLIPPAGE_PCT       = 0.0002   # slippage taker pares líquidos: 0.02% (maker ≈ 0)
 FUNDING_8H_PCT     = 0.0001   # funding promedio ~0.01% cada 8h (variable)
 
-def costo_round_trip(notional_usd: float) -> float:
-    """Costo total de abrir+cerrar una posición de tamaño notional_usd.
-    Comisión 2 lados + slippage 2 lados. NO incluye market impact
-    (confirmado irrelevante para órdenes retail por la Square-Root Law)."""
-    comision  = notional_usd * COMISION_TAKER_PCT * 2     # entrada + salida
-    slippage  = notional_usd * SLIPPAGE_PCT * 2
-    return comision + slippage
+def costo_lado(notional_usd: float, tipo: str = "taker") -> float:
+    """Costo de un lado. maker (limit) = solo comisión; taker (market) = comisión + slippage."""
+    if tipo == "maker":
+        return notional_usd * COMISION_MAKER_PCT
+    return notional_usd * (COMISION_TAKER_PCT + SLIPPAGE_PCT)
 
 def costo_funding(notional_usd: float, horas_abierto: float) -> float:
     """Funding acumulado: se cobra cada 8h. Aproximación lineal."""
-    periodos_8h = horas_abierto / 8.0
-    return notional_usd * FUNDING_8H_PCT * periodos_8h
+    return notional_usd * FUNDING_8H_PCT * (horas_abierto / 8.0)
 
-def costo_total_trade(notional_usd: float, horas_abierto: float = 0.0) -> float:
-    return costo_round_trip(notional_usd) + costo_funding(notional_usd, horas_abierto)
+def costo_total_trade(notional_usd: float, horas_abierto: float = 0.0,
+                      entrada_tipo: str = "maker", salida_tipo: str = "taker") -> float:
+    """v2.16: entrada por limit (maker), salida maker si TP / taker si SL."""
+    return (costo_lado(notional_usd, entrada_tipo) +
+            costo_lado(notional_usd, salida_tipo) +
+            costo_funding(notional_usd, horas_abierto))
+
+def costo_round_trip(notional_usd: float) -> float:
+    """Round-trip taker puro (referencia/compatibilidad)."""
+    return costo_lado(notional_usd, "taker") * 2
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ROLL (1984) — spread efectivo solo con precios de cierre
