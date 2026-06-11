@@ -78,6 +78,36 @@ CACHE_BTC_MOM_SECS  = 60         # refrescar momentum BTC cada 60s
 
 RR_MINIMO           = 1.8        # ratio R:R mínimo TP2/SL — rechaza trades con potencial insuficiente
 
+# ── COSTOS DE TRANSACCIÓN — v2.15 ──────────────────────────────────────────────
+# El #1 destructor de alfa (Manual Quant + ML4T). El PnL DRY-RUN ahora descuenta
+# costos reales para que las métricas en vivo NO sean ficción optimista.
+# Square-Root Law confirmó: market impact irrelevante para órdenes retail → solo
+# comisión + slippage + funding.
+COMISION_TAKER_PCT  = 0.0005     # Binance Futures USDT-M taker: 0.05% por lado
+SLIPPAGE_PCT        = 0.0002     # slippage estimado pares líquidos: 0.02%/lado
+FUNDING_8H_PCT      = 0.0001     # funding ~0.01% cada 8h
+
+# ── TIME-STOP — v2.15 (concepto half-life Ornstein-Uhlenbeck) ──────────────────
+# Una posición que no resuelve en N horas pierde su edge (la señal caducó).
+# El backtest mostró trades de 48h que terminaban en SL. Se cierran a mercado.
+MAX_HORAS_POSICION  = 24         # cerrar posición abierta > 24h sin resolver
+
+# ── DE-RISKING tras pérdidas consecutivas — v2.15 (anti-martingala) ────────────
+# Un sistema profesional reduce tamaño cuando está perdiendo, no lo mantiene.
+SL_CONSECUTIVOS_DERISK = 2       # tras 2 SLs seguidos → reducir riesgo
+DERISK_FACTOR          = 0.5     # riesgo a la mitad (2% → 1%) hasta el próximo win
+
+# ── FILTRO DE NOTICIAS — v2.15 (del bootcamp ICT) ──────────────────────────────
+# No operar alrededor de datos de alto impacto (CPI/PPI/FOMC/NFP) — la volatilidad
+# de noticias barre SLs. Formato: ("YYYY-MM-DD HH:MM" UTC, "etiqueta"). Editable.
+NOTICIAS_MARGEN_MIN = 30         # minutos antes/después de la noticia en que NO se opera
+NOTICIAS_ALTO_IMPACTO = [
+    # Ejemplos — actualizar con el calendario económico real (forexfactory/investing):
+    ("2026-06-11 12:30", "CPI EE.UU."),
+    ("2026-06-18 18:00", "FOMC"),
+    ("2026-07-03 12:30", "NFP"),
+]
+
 TF_TENDENCIA        = "1h"
 TF_MACRO            = "4h"       # filtro macro — 4h y 1h deben coincidir en dirección
 TF_ENTRADA          = "15m"
@@ -232,15 +262,28 @@ ESTADO_ARCHIVO       = "estado_bot.json"
 def calcular_riesgo_actual() -> float:
     """Retorna el riesgo en USD para el próximo trade según el capital actual.
     Usa RIESGO_PCT (2%) del capital real acumulado, con piso y techo.
+    De-risking v2.15: tras SLs consecutivos, reduce el riesgo a la mitad.
     Ejemplo: $50 capital → $1.00 riesgo | $100 capital → $2.00 riesgo."""
     riesgo = estado.capital_actual * RIESGO_PCT
+    if _sl_consecutivos >= SL_CONSECUTIVOS_DERISK:
+        riesgo *= DERISK_FACTOR   # anti-martingala: bajar tamaño mientras se pierde
     return round(max(RIESGO_MIN_USD, min(riesgo, RIESGO_MAX_USD)), 2)
+
+def costo_trade(notional_usd: float, horas_abierto: float = 0.0) -> float:
+    """Costo realista de un trade: comisión+slippage round-trip + funding. v2.15.
+    Se descuenta del PnL para que las métricas no sean ficción optimista."""
+    round_trip = notional_usd * (COMISION_TAKER_PCT + SLIPPAGE_PCT) * 2
+    funding    = notional_usd * FUNDING_8H_PCT * (horas_abierto / 8.0)
+    return round_trip + funding
 
 # Caché de tendencia 4h (no llamar a la API en cada ciclo de 20s)
 _cache_macro: dict = {}   # simbolo → (datetime, "ALCISTA"|"BAJISTA"|"NEUTRAL")
 
 # Registro de SLs recientes para pausa global
 _sl_recientes: list = []  # lista de datetime de SLs
+
+# Contador de SLs consecutivos para de-risking (resetea con cualquier win) — v2.15
+_sl_consecutivos: int = 0
 
 # Control spam log CB
 _ultimo_aviso_cb: datetime = datetime(2000, 1, 1)
@@ -897,11 +940,29 @@ def _puede_abrir_por_correlacion(simbolo: str, direccion: str) -> bool:
         return False
     return True
 
+def cerca_de_noticia() -> tuple:
+    """v2.15 (bootcamp ICT): True si estamos dentro de NOTICIAS_MARGEN_MIN de un
+    evento de alto impacto (CPI/FOMC/NFP). La volatilidad de noticias barre SLs."""
+    ahora = datetime.now(timezone.utc).replace(tzinfo=None)
+    for fecha_str, etiqueta in NOTICIAS_ALTO_IMPACTO:
+        try:
+            t_noticia = datetime.strptime(fecha_str, "%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+        if abs((ahora - t_noticia).total_seconds()) / 60.0 <= NOTICIAS_MARGEN_MIN:
+            return True, etiqueta
+    return False, ""
+
 def abrir_posicion(senal: Senal) -> None:
     if simbolo_ya_abierto(senal.simbolo):
         return
     if en_cooldown(senal.simbolo):
         log.info("Cooldown activo en %s — señal ignorada", senal.simbolo)
+        return
+    en_noticia, etiqueta = cerca_de_noticia()
+    if en_noticia:
+        log.info("📰 Noticia alto impacto (%s) ±%dmin — %s no se abre",
+                 etiqueta, NOTICIAS_MARGEN_MIN, senal.simbolo)
         return
     if not _puede_abrir_por_correlacion(senal.simbolo, senal.direccion):
         return
@@ -1024,6 +1085,14 @@ def monitorear_posiciones() -> None:
             log.warning("Error precio %s: %s", simbolo, e)
             continue
 
+        # ── TIME-STOP v2.15 — la señal caducó, cerrar a mercado ────────────
+        horas_abierta = (datetime.now(timezone.utc).replace(tzinfo=None) - pos.timestamp).total_seconds() / 3600.0
+        if horas_abierta >= MAX_HORAS_POSICION:
+            log.info("Time-stop %s: %.1fh abierta (> %dh) — cerrando, edge caducado",
+                     simbolo, horas_abierta, MAX_HORAS_POSICION)
+            cerrar_posicion(pos, precio, "TimeStop")
+            continue
+
         # ── LONG monitoring ────────────────────────────────────────────────
         if pos.direccion == "LONG":
             if pos.tp1_cerrado:
@@ -1052,6 +1121,8 @@ def cerrar_parcial(pos: Posicion, precio_scan: float, motivo: str) -> None:
     # Usar precio exacto del TP1, no el precio del scan (puede ser mejor o peor)
     precio_calc = pos.precio_tp1
     ganancia = abs(precio_calc - pos.precio_entrada) / pos.precio_entrada * pos.tamano_usd * TP1_CIERRE_PCT
+    # v2.15: descontar costos reales de la porción cerrada (comisión+slippage)
+    ganancia -= costo_trade(pos.tamano_usd * TP1_CIERRE_PCT)
     pos.tp1_cerrado = True
     # Mover SL a breakeven — la operación ya no puede perder
     pos.precio_sl = pos.precio_entrada
@@ -1098,6 +1169,9 @@ def cerrar_posicion(pos: Posicion, precio_scan: float, motivo: str) -> None:
         signo = 1 if precio_calc > pos.precio_entrada else -1
 
     pnl = pct * pos.tamano_usd * factor * signo
+    # v2.15: descontar costos reales (comisión+slippage round-trip + funding por horas)
+    horas_abierto = (datetime.now(timezone.utc).replace(tzinfo=None) - pos.timestamp).total_seconds() / 3600.0
+    pnl -= costo_trade(pos.tamano_usd * factor, horas_abierto)
 
     if DRY_RUN:
         log.info("[DRY-RUN] CERRAR %s %s @ %.4f (%s) | PnL $%.2f",
@@ -1111,14 +1185,17 @@ def cerrar_posicion(pos: Posicion, precio_scan: float, motivo: str) -> None:
             log.error("Error cierre posición %s: %s", pos.simbolo, e)
             return
 
+    global _sl_consecutivos
     if pnl >= 0:
         estado.ganancia_dia   += pnl
         estado.capital_actual += pnl
         if estado.capital_actual > estado.capital_pico:  # nuevo pico histórico
             estado.capital_pico = estado.capital_actual
+        _sl_consecutivos = 0   # v2.15: un cierre ganador resetea el de-risking
     else:
         estado.perdida_dia    += abs(pnl)
         estado.capital_actual  = max(estado.capital_actual - abs(pnl), RIESGO_MIN_USD * 5)
+        _sl_consecutivos += 1  # v2.15: racha de pérdidas → reduce riesgo del próximo trade
         if motivo == "SL":
             activar_cooldown(pos.simbolo)
             _registrar_sl_global()  # detectar rachas de pérdidas para pausa global
@@ -1201,7 +1278,7 @@ def main() -> None:
     estado = cargar_estado()
     modo = "DRY-RUN (simulación)" if DRY_RUN else "⚠️  REAL EN TESTNET"
     log.info("=" * 60)
-    log.info("YKAI TradingBot v2.14 iniciado — modo: %s", modo)
+    log.info("YKAI TradingBot v2.15 iniciado — modo: %s", modo)
     log.info("Capital actual: $%.2f | Pico: $%.2f | Riesgo/trade: $%.2f (%.0f%%) | CB diario: $%.2f | Max DD: %.0f%%",
              estado.capital_actual, estado.capital_pico, calcular_riesgo_actual(),
              RIESGO_PCT * 100, MAX_PERDIDA_DIA, MAX_DRAWDOWN_PCT * 100)
@@ -1222,6 +1299,11 @@ def main() -> None:
     log.info("Max posiciones: %d | Score mínimo: %d/6 | Trail factor: %.1f",
              MAX_TRADES_ABIERTOS, SCORE_MINIMO, TRAIL_FACTOR)
     log.info("Scan cada %ds | TF tendencia: %s | TF entrada: %s", INTERVALO_SCAN, TF_TENDENCIA, TF_ENTRADA)
+    log.info("Costos: comisión %.3f%% + slippage %.3f%% (RT %.2f%%) | Time-stop: %dh | De-risk: %d SLs→x%.1f",
+             COMISION_TAKER_PCT*100, SLIPPAGE_PCT*100, (COMISION_TAKER_PCT+SLIPPAGE_PCT)*2*100,
+             MAX_HORAS_POSICION, SL_CONSECUTIVOS_DERISK, DERISK_FACTOR)
+    log.info("Filtro noticias: %d eventos cargados, ±%dmin | Filtro régimen ADX: zona muerte [%.0f-%.0f)",
+             len(NOTICIAS_ALTO_IMPACTO), NOTICIAS_MARGEN_MIN, ADX_ZONA_MUERTE_MIN, ADX_ZONA_MUERTE_MAX)
     log.info("=" * 60)
 
     enviar_telegram(
